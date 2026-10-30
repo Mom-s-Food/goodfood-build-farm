@@ -1,0 +1,229 @@
+# Checks one commit of the private Mom-s-Food/goodfood-main repository on public
+# runners (unlimited minutes for a public repository). This repository holds no
+# application source: every job checks the private source out with the
+# PRIVATE_REPO_PAT secret, never persists the credential, and reports the result
+# back to the private commit as the `farm/ci` status.
+#
+# Logs of a public repository are public. Nothing here prints a secret, test data
+# is synthetic, and CARGO_TERM_COLOR=never keeps the logs plain; a compiler error
+# does quote the failing source lines, which the owner accepted (2026-11-03).
+name: farm-ci
+
+on:
+  repository_dispatch:
+    types: [trigger-ci]
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Full commit SHA of Mom-s-Food/goodfood-main; empty checks main'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: farm-ci-${{ github.event.client_payload.source_ref || inputs.source_ref || 'main' }}
+  cancel-in-progress: true
+
+env:
+  PRIVATE_REPO: Mom-s-Food/goodfood-main
+  NEXTEST_VERSION: 0.9.97
+  OPENAPI_TO_RUST_VERSION: 0.23.0
+  CARGO_DENY_VERSION: 0.18.3
+  CARGO_AUDIT_VERSION: 0.21.2
+
+jobs:
+  setup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      source_ref: ${{ steps.pin.outputs.source_ref }}
+    steps:
+      - name: Validate the request
+        env:
+          REQUESTED: ${{ github.event.client_payload.source_ref || inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "$REQUESTED" ] && ! printf '%s' "$REQUESTED" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::source_ref must be a full lowercase commit SHA"; exit 1
+          fi
+      - name: Resolve the private source once
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ github.event.client_payload.source_ref || inputs.source_ref || 'main' }}
+          persist-credentials: false
+      - name: Pin the exact commit
+        id: pin
+        run: printf 'source_ref=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Mark the private commit pending
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
+          SHA: ${{ steps.pin.outputs.source_ref }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$PRIVATE_REPO/statuses/$SHA" -X POST \
+            -f state=pending -f context=farm/ci -f target_url="$RUN_URL" \
+            -f description="Build farm checks running" > /dev/null
+
+  rust:
+    needs: setup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: never
+      GOODFOOD_TEST_DATABASE_URL: postgres://postgres:goodfood@localhost:5432/postgres?sslmode=disable
+    services:
+      postgres:
+        image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+        env:
+          POSTGRES_PASSWORD: goodfood
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Check out the pinned private source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ needs.setup.outputs.source_ref }}
+          persist-credentials: false
+          # The prompt-ledger and derivation-ledger tests compare with origin/main.
+          fetch-depth: 0
+      - name: Verify the source
+        env:
+          EXPECTED: ${{ needs.setup.outputs.source_ref }}
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$EXPECTED" ]
+          [ -z "$(git status --porcelain)" ]
+      - name: Rust toolchain (stable, with clippy and rustfmt)
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt --no-self-update
+      - name: Cache the cargo registry and target directory
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            backend/target
+          key: farm-rust-${{ runner.os }}-${{ hashFiles('backend/Cargo.lock', 'backend/rust-toolchain.toml') }}
+          restore-keys: farm-rust-${{ runner.os }}-
+      - name: Cache cargo tools
+        id: tools
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/bin/cargo-nextest
+            ~/.cargo/bin/openapi-to-rust
+          key: farm-tools-${{ runner.os }}-${{ env.NEXTEST_VERSION }}-${{ env.OPENAPI_TO_RUST_VERSION }}
+      - name: Install cargo tools
+        if: steps.tools.outputs.cache-hit != 'true'
+        run: |
+          cargo install --locked --version "$NEXTEST_VERSION" cargo-nextest
+          cargo install --locked --version "$OPENAPI_TO_RUST_VERSION" openapi-to-rust
+      - name: Format
+        working-directory: backend
+        run: cargo fmt --all --check
+      - name: Clippy (warnings are errors)
+        working-directory: backend
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests (T1, T2; PostgreSQL service container)
+        working-directory: backend
+        run: |
+          cargo nextest run --workspace --locked --no-tests=pass --no-fail-fast
+          cargo test --workspace --doc --locked
+      - name: Generated api-types match the contract
+        run: scripts/contracts/generate-rs.sh --check
+      - name: Evaluation suites are well formed (T5 dataset check)
+        working-directory: backend
+        run: cargo run --quiet --locked -p goodfood-evals -- --root ../evals
+
+  supply-chain:
+    needs: setup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ needs.setup.outputs.source_ref }}
+          persist-credentials: false
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Cache cargo-deny and cargo-audit
+        id: tools
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/bin/cargo-audit
+          key: farm-supply-${{ runner.os }}-${{ env.CARGO_DENY_VERSION }}-${{ env.CARGO_AUDIT_VERSION }}
+      - name: Install cargo-deny and cargo-audit
+        if: steps.tools.outputs.cache-hit != 'true'
+        run: |
+          cargo install --locked --version "$CARGO_DENY_VERSION" cargo-deny
+          cargo install --locked --version "$CARGO_AUDIT_VERSION" cargo-audit
+      - name: cargo-deny (policy in backend/deny.toml)
+        run: cargo deny --manifest-path backend/Cargo.toml check
+      - name: cargo-audit (RUSTSEC-2023-0071 for rsa is accepted, see backend/deny.toml)
+        run: cargo audit --file backend/Cargo.lock --ignore RUSTSEC-2023-0071
+
+  scripts:
+    needs: setup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ needs.setup.outputs.source_ref }}
+          persist-credentials: false
+      - name: PyYAML for the infra checks
+        run: python3 -m pip install --user pyyaml
+      - name: Script unit tests
+        run: |
+          python3 -I -m unittest discover -s scripts/test -p 'test_*.py'
+          python3 -m unittest discover -s scripts/ci -p 'test_*.py'
+      - name: Infra consistency, links, coverage listing
+        run: |
+          python3 scripts/ci/check-infra-consistency.py
+          python3 -I scripts/ci/check-links.py
+          python3 -I scripts/test/req-coverage.py --lane-tests T8 > /dev/null
+
+  report:
+    needs: [setup, rust, supply-chain, scripts]
+    if: always() && needs.setup.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Report the result to the private commit
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
+          SHA: ${{ needs.setup.outputs.source_ref }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUST: ${{ needs.rust.result }}
+          SUPPLY: ${{ needs.supply-chain.result }}
+          SCRIPTS: ${{ needs.scripts.result }}
+        run: |
+          set -euo pipefail
+          if [ "$RUST" = success ] && [ "$SUPPLY" = success ] && [ "$SCRIPTS" = success ]; then
+            state=success; desc="Build farm checks passed"
+          else
+            state=failure; desc="rust=$RUST supply-chain=$SUPPLY scripts=$SCRIPTS"
+          fi
+          gh api "repos/$PRIVATE_REPO/statuses/$SHA" -X POST \
+            -f state="$state" -f context=farm/ci -f target_url="$RUN_URL" -f description="$desc" > /dev/null
+          echo "farm/ci: $state ($desc)"
+          [ "$state" = success ]

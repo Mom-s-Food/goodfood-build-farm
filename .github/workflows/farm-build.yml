@@ -1,0 +1,119 @@
+# Builds the backend images of one private goodfood-main commit on public runners
+# and pushes them to the private GHCR packages (ghcr.io/mom-s-food/goodfood-main/
+# api and worker). OCI pulls them by digest; this workflow never deploys. The
+# deploy step joins once the OCI pay-as-you-go tenancy is ready and the owner has
+# approved it (AGENTS.md: production deploys need the owner's approval).
+#
+# arm64 only: the OCI nodes are Ampere A1. Each run uploads a release receipt with
+# the source commit and the image digests; that is what a deploy reads.
+name: farm-build
+
+on:
+  repository_dispatch:
+    types: [trigger-build]
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Full commit SHA of Mom-s-Food/goodfood-main; empty builds main'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: farm-build
+  cancel-in-progress: false
+
+env:
+  PRIVATE_REPO: Mom-s-Food/goodfood-main
+  REGISTRY: ghcr.io
+  IMAGE_BASE: ghcr.io/mom-s-food/goodfood-main
+
+jobs:
+  setup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      source_ref: ${{ steps.pin.outputs.source_ref }}
+    steps:
+      - name: Validate the request
+        env:
+          REQUESTED: ${{ github.event.client_payload.source_ref || inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "$REQUESTED" ] && ! printf '%s' "$REQUESTED" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::source_ref must be a full lowercase commit SHA"; exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ github.event.client_payload.source_ref || inputs.source_ref || 'main' }}
+          persist-credentials: false
+      - name: Pin the exact commit
+        id: pin
+        run: printf 'source_ref=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  images:
+    needs: setup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [api, worker]
+    steps:
+      - name: Check out the pinned private source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ needs.setup.outputs.source_ref }}
+          persist-credentials: false
+      - name: Verify the source
+        env:
+          EXPECTED: ${{ needs.setup.outputs.source_ref }}
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$EXPECTED" ]
+          [ -z "$(git status --porcelain)" ]
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.PRIVATE_REPO_PAT }}
+      - name: Build and push ${{ matrix.target }} (arm64)
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: backend/Dockerfile
+          target: ${{ matrix.target }}
+          platforms: linux/arm64
+          build-args: SERVER_VERSION=${{ needs.setup.outputs.source_ref }}
+          tags: ${{ env.IMAGE_BASE }}/${{ matrix.target }}:${{ needs.setup.outputs.source_ref }}
+          push: true
+          provenance: false
+          cache-from: type=gha,scope=farm-${{ matrix.target }}
+          cache-to: type=gha,scope=farm-${{ matrix.target }},mode=max
+      - name: Write the release receipt
+        env:
+          TARGET: ${{ matrix.target }}
+          SOURCE: ${{ needs.setup.outputs.source_ref }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          mkdir -p "$RUNNER_TEMP/release"
+          jq -n --arg source_ref "$SOURCE" --arg target "$TARGET" \
+            --arg image "$IMAGE_BASE/$TARGET@$DIGEST" \
+            '{source_ref:$source_ref,target:$target,image:$image}' > "$RUNNER_TEMP/release/$TARGET.json"
+          cat "$RUNNER_TEMP/release/$TARGET.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ matrix.target }}
+          path: ${{ runner.temp }}/release/${{ matrix.target }}.json
+          if-no-files-found: error
+          retention-days: 30
