@@ -135,9 +135,13 @@ jobs:
         working-directory: backend
         run: cargo fmt --all --check
       - name: Clippy (warnings are errors)
+        # Run even when an earlier check failed, so one push reports every problem; the job still fails.
+        if: ${{ !cancelled() }}
         working-directory: backend
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
       - name: Tests (T1, T2; PostgreSQL service container)
+        # Run even when an earlier check failed, so one push reports every problem; the job still fails.
+        if: ${{ !cancelled() }}
         working-directory: backend
         run: |
           cargo nextest run --workspace --locked --no-tests=pass --no-fail-fast
