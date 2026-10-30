@@ -94,17 +94,19 @@ jobs:
           gh api "repos/$PRIVATE_REPO/statuses/$SHA" -X POST \
             -f state=pending -f context="$STATUS_CONTEXT" -f target_url="$RUN_URL" \
             -f description="Build farm checks running" > /dev/null
-      # Only runs of the current main tip save the Rust caches: one entry per kind, which
-      # every branch then restores (the repository cache is 10 GB in all).
-      - name: Is this the tip of main
+      # Only runs of commits on main save the Rust caches (and only when Cargo.lock or the
+      # toolchain changed): one entry per kind, which every branch then restores, so branches
+      # never churn the 10 GB repository cache.
+      - name: Is this commit on main
         id: main
         env:
           GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
           SHA: ${{ steps.pin.outputs.source_ref }}
         run: |
           set -euo pipefail
-          tip="$(gh api "repos/$PRIVATE_REPO/commits/main" --jq .sha || true)"
-          if [ "$tip" = "$SHA" ]; then echo on_main=true; else echo on_main=false; fi >> "$GITHUB_OUTPUT"
+          rel="$(gh api "repos/$PRIVATE_REPO/compare/main...$SHA" --jq .status || echo unknown)"
+          case $rel in identical | behind) on_main=true ;; *) on_main=false ;; esac
+          echo "on_main=$on_main" >> "$GITHUB_OUTPUT"; echo "on main: $on_main ($rel)"
 
   rust-lint:
     name: rust / fmt, clippy, api-types
@@ -231,11 +233,12 @@ jobs:
           import json, sys
           meta, k, n = json.load(open(sys.argv[1])), int(sys.argv[2]), int(sys.argv[3])
           # Summed test seconds per package (farm run 41111807233, 2026-10-30); 3 for any other.
+          # goodfood-evals stands for the evaluation dataset check (about 40 s on 4 threads).
           weight = {"rest": 248, "foods": 209, "agent": 201, "coach": 110, "kitchen": 105,
                     "logging": 99, "app": 97, "intent": 58, "imports": 49, "platform-jobs": 45,
                     "goals": 40, "planner": 38, "identity": 37, "preferences": 31, "profile": 24,
                     "platform-db": 16, "platform-httpx": 16, "analytics": 14, "privacy": 12,
-                    "shopping": 11, "evals": 10, "platform-ai": 8}
+                    "shopping": 11, "evals": 10, "platform-ai": 8, "goodfood-evals": 160}
           pkgs = sorted(meta["packages"], key=lambda p: (-weight.get(p["name"], 3), p["name"]))
           parts, load = [[] for _ in range(n)], [0] * n
           for p in pkgs:  # heaviest first, each to the lightest partition
