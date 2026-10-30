@@ -1,0 +1,607 @@
+# Candidate replacement for farm-ci.yml (same triggers and inputs). It reports the
+# `farm/ci-next` status, never `farm/ci`, so it can run beside farm-ci for comparison.
+#
+# Checks one commit of the private Mom-s-Food/goodfood-main repository on public
+# runners (unlimited minutes for a public repository). This repository holds no
+# application source: every job checks the private source out with the
+# PRIVATE_REPO_PAT secret, never persists the credential, and reports the result
+# back to the private commit.
+#
+# Logs of a public repository are public. Nothing here prints a secret, test data
+# is synthetic, and CARGO_TERM_COLOR=never keeps the logs plain; a compiler error
+# does quote the failing source lines, which the owner accepted (2026-11-03).
+#
+# Layout (every job after setup runs in parallel unless it needs another):
+#   setup ─┬─ rust-lint (fmt, clippy, api-types) ────────────────┐
+#          ├─ rust-build (nextest archive, doc tests, evals) ─ rust-test (1..3) ─ rust (aggregate)
+#          ├─ supply-chain (cargo-deny, cargo-audit)                              │
+#          ├─ scripts (every script suite, ShellCheck, site, design tokens)      │
+#          └─ policy (Helm/GitOps, OpenTofu, Trivy, contracts, workflows, gitleaks) ─ report
+# Speed: Swatinem/rust-cache keeps the compiled dependencies (saved from main only, so the
+# 10 GB repository cache is not churned by branches); no debuginfo keeps the target small;
+# the tests are compiled once, archived, and run in three partitions against a
+# PostgreSQL on tmpfs with fsync off.
+name: farm-ci-next
+
+on:
+  repository_dispatch:
+    types: [trigger-ci-next]
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Full commit SHA of Mom-s-Food/goodfood-main; empty checks main'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: farm-ci-next-${{ github.event.client_payload.source_ref || inputs.source_ref || 'main' }}
+  cancel-in-progress: true
+
+env:
+  PRIVATE_REPO: Mom-s-Food/goodfood-main
+  STATUS_CONTEXT: farm/ci-next
+  NEXTEST_VERSION: 0.9.148
+  OPENAPI_TO_RUST_VERSION: 0.23.0
+  CARGO_DENY_VERSION: 0.20.2
+  CARGO_AUDIT_VERSION: 0.22.2
+  # The same tool versions as the private ci.yml.
+  HELM_VERSION: v3.22.0
+  KUSTOMIZE_VERSION: v5.8.1
+  KUBECONFORM_VERSION: v0.8.0
+  TOFU_VERSION: 1.12.1
+  TFLINT_VERSION: v0.64.0
+  TRIVY_VERSION: v0.75.0
+  GITLEAKS_VERSION: 8.30.1
+  ACTIONLINT_VERSION: 1.7.12
+  PYYAML_VERSION: 6.0.3
+
+jobs:
+  setup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      source_ref: ${{ steps.pin.outputs.source_ref }}
+      on_main: ${{ steps.main.outputs.on_main }}
+    steps:
+      - name: Validate the request
+        env:
+          REQUESTED: ${{ github.event.client_payload.source_ref || inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "$REQUESTED" ] && ! printf '%s' "$REQUESTED" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::source_ref must be a full lowercase commit SHA"; exit 1
+          fi
+      - name: Resolve the private source once
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ github.event.client_payload.source_ref || inputs.source_ref || 'main' }}
+          persist-credentials: false
+      - name: Pin the exact commit
+        id: pin
+        run: printf 'source_ref=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Mark the private commit pending
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
+          SHA: ${{ steps.pin.outputs.source_ref }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$PRIVATE_REPO/statuses/$SHA" -X POST \
+            -f state=pending -f context="$STATUS_CONTEXT" -f target_url="$RUN_URL" \
+            -f description="Build farm checks running" > /dev/null
+      # Only runs of the current main tip save the Rust caches: one entry per kind, which
+      # every branch then restores (the repository cache is 10 GB in all).
+      - name: Is this the tip of main
+        id: main
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
+          SHA: ${{ steps.pin.outputs.source_ref }}
+        run: |
+          set -euo pipefail
+          tip="$(gh api "repos/$PRIVATE_REPO/commits/main" --jq .sha || true)"
+          if [ "$tip" = "$SHA" ]; then echo on_main=true; else echo on_main=false; fi >> "$GITHUB_OUTPUT"
+
+  rust-lint:
+    name: rust / fmt, clippy, api-types
+    needs: setup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: never
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - name: Check out the pinned private source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ needs.setup.outputs.source_ref }}
+          persist-credentials: false
+      - name: Rust toolchain (stable, with clippy and rustfmt)
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt --no-self-update
+      - name: Format
+        working-directory: backend
+        run: cargo fmt --all --check
+      - name: Restore the clippy dependency cache
+        if: ${{ !cancelled() }}
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: backend
+          shared-key: farm-clippy
+          cache-bin: "false"
+          save-if: ${{ needs.setup.outputs.on_main == 'true' }}
+      - name: Clippy (warnings are errors)
+        # Run even when an earlier check failed, so one push reports every problem; the job still fails.
+        if: ${{ !cancelled() }}
+        working-directory: backend
+        run: cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
+      - name: Cache openapi-to-rust
+        if: ${{ !cancelled() }}
+        id: o2r
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/openapi-to-rust
+          key: farm-o2r-${{ runner.os }}-${{ env.OPENAPI_TO_RUST_VERSION }}
+      - name: Install openapi-to-rust
+        if: ${{ !cancelled() && steps.o2r.outputs.cache-hit != 'true' }}
+        run: cargo install --locked --version "$OPENAPI_TO_RUST_VERSION" openapi-to-rust
+      - name: Generated api-types match the contract
+        if: ${{ !cancelled() }}
+        run: scripts/contracts/generate-rs.sh --check
+
+  rust-build:
+    name: rust / build tests, doc tests, evals
+    needs: setup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: never
+      # No debuginfo: a panic still names its file and line; the target and the
+      # test archive shrink to a fraction.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - name: Check out the pinned private source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ needs.setup.outputs.source_ref }}
+          persist-credentials: false
+      - name: Verify the source
+        env:
+          EXPECTED: ${{ needs.setup.outputs.source_ref }}
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$EXPECTED" ]
+          [ -z "$(git status --porcelain)" ]
+      - name: Rust toolchain (stable)
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: cargo-nextest
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+      - name: Restore the test dependency cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: backend
+          shared-key: farm-tests
+          cache-bin: "false"
+          save-if: ${{ needs.setup.outputs.on_main == 'true' }}
+      - name: Build every test binary once (nextest archive)
+        working-directory: backend
+        run: cargo nextest archive --workspace --locked --archive-file "$RUNNER_TEMP/nextest.tar.zst"
+      - name: Upload the test archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}/nextest.tar.zst
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+      - name: Doc tests
+        if: ${{ !cancelled() }}
+        working-directory: backend
+        run: cargo test --workspace --doc --locked
+      - name: Evaluation suites are well formed (T5 dataset check)
+        if: ${{ !cancelled() }}
+        working-directory: backend
+        run: cargo run --quiet --locked -p goodfood-evals -- --root ../evals
+
+  rust-test:
+    name: rust / tests ${{ matrix.partition }}/3
+    needs: [setup, rust-build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3]
+    env:
+      CARGO_TERM_COLOR: never
+      NEXTEST_HIDE_PROGRESS_BAR: "1"
+      GOODFOOD_TEST_DATABASE_URL: postgres://postgres:goodfood@localhost:5432/postgres?sslmode=disable
+      # The prompt and derivation ledger tests compare with main (they must not skip silently).
+      GOODFOOD_DERIVATION_BASE: origin/main
+      GOODFOOD_PROMPT_BASE: origin/main
+    steps:
+      # A throwaway server: data on tmpfs, no fsync, no full-page writes. Durability means
+      # nothing here and the tests create and drop hundreds of databases.
+      - name: Start PostgreSQL 18 (tmpfs, fsync off)
+        run: |
+          docker run -d --name pg -p 5432:5432 -e POSTGRES_PASSWORD=goodfood \
+            --tmpfs /var/lib/postgresql:rw,size=8g \
+            postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873 \
+            -c fsync=off -c synchronous_commit=off -c full_page_writes=off \
+            -c max_connections=300 -c shared_buffers=512MB > /dev/null
+      - name: Check out the pinned private source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ needs.setup.outputs.source_ref }}
+          persist-credentials: false
+          # The prompt-ledger and derivation-ledger tests compare with origin/main.
+          fetch-depth: 0
+      - name: cargo-nextest
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+      - name: Download the test archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}
+      - name: Wait for PostgreSQL
+        run: |
+          for _ in $(seq 1 60); do
+            docker exec pg pg_isready -U postgres -h 127.0.0.1 > /dev/null 2>&1 && exit 0
+            sleep 1
+          done
+          docker logs pg; exit 1
+      - name: Tests (T1, T2), partition ${{ matrix.partition }} of 3
+        run: |
+          cargo nextest run --archive-file "$RUNNER_TEMP/nextest.tar.zst" --workspace-remap backend \
+            --partition "count:${{ matrix.partition }}/3" --no-fail-fast --no-tests=pass
+
+  rust:
+    # The aggregate the farm/ci description names: fmt, clippy, api-types, every test
+    # partition, doc tests and the evaluation dataset check.
+    needs: [setup, rust-lint, rust-build, rust-test]
+    if: ${{ !cancelled() && needs.setup.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Every Rust job passed
+        env:
+          LINT: ${{ needs.rust-lint.result }}
+          BUILD: ${{ needs.rust-build.result }}
+          TEST: ${{ needs.rust-test.result }}
+        run: |
+          echo "fmt/clippy/api-types=$LINT build/doc-tests/evals=$BUILD tests=$TEST"
+          [ "$LINT" = success ] && [ "$BUILD" = success ] && [ "$TEST" = success ]
+
+  supply-chain:
+    needs: setup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ needs.setup.outputs.source_ref }}
+          persist-credentials: false
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: cargo-deny and cargo-audit
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: cargo-deny@${{ env.CARGO_DENY_VERSION }},cargo-audit@${{ env.CARGO_AUDIT_VERSION }}
+      - name: cargo-deny (policy in backend/deny.toml)
+        run: cargo deny --manifest-path backend/Cargo.toml check
+      - name: cargo-audit (RUSTSEC-2023-0071 for rsa is accepted, see backend/deny.toml)
+        if: ${{ !cancelled() }}
+        run: cargo audit --file backend/Cargo.lock --ignore RUSTSEC-2023-0071
+
+  # Every script check of the private ci.yml (its scripts and docs jobs) plus the farm's own.
+  scripts:
+    needs: setup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ needs.setup.outputs.source_ref }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: PyYAML
+        run: python -m pip install --quiet "pyyaml==$PYYAML_VERSION"
+      - name: Python unit tests
+        if: ${{ !cancelled() }}
+        run: |
+          rc=0
+          for d in scripts/test scripts/lib scripts/ci scripts/secrets; do
+            for p in 'test_*.py' '*_test.py'; do
+              if compgen -G "$d/$p" > /dev/null; then
+                echo "::group::$d $p"
+                python -I -m unittest discover -s "$d" -p "$p" || { rc=1; echo "::error::python tests failed in $d ($p)"; }
+                echo "::endgroup::"
+              fi
+            done
+          done
+          exit $rc
+      - name: Shell test suites (every suite runs; failures are collected)
+        if: ${{ !cancelled() }}
+        run: |
+          rc=0; failed=()
+          while IFS= read -r t; do
+            echo "::group::$t"
+            if ! bash "$t"; then rc=1; failed+=("$t"); fi
+            echo "::endgroup::"
+          done < <(find scripts -name '*_test.sh' | sort)
+          for t in "${failed[@]}"; do echo "::error file=$t::$t failed"; done
+          exit $rc
+      - name: ShellCheck
+        if: ${{ !cancelled() }}
+        run: git ls-files -z 'scripts/*.sh' 'scripts/dev/hooks/*' | xargs -0 shellcheck -x -S warning
+      - name: Secrets inventory is valid (no values, known vaults, rotation fields)
+        if: ${{ !cancelled() }}
+        run: bash scripts/secrets/check.sh
+      - name: Public site structure, links and draft banners
+        if: ${{ !cancelled() }}
+        run: python -I scripts/ci/check-site.py
+      - name: Relative links and anchors
+        if: ${{ !cancelled() }}
+        run: python -I scripts/ci/check-links.py
+      - name: Requirement coverage listing
+        if: ${{ !cancelled() }}
+        run: python -I scripts/test/req-coverage.py --lane-tests T8 > /dev/null
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: ${{ !cancelled() }}
+        with:
+          go-version-file: scripts/design/gen-tokens/go.mod
+          cache: false
+      - name: Design tokens are generated and accessible
+        if: ${{ !cancelled() }}
+        run: |
+          go -C scripts/design/gen-tokens test -race -count=1 ./...
+          go -C scripts/design/gen-tokens run . --check
+
+  # The private ci.yml's deploy, infra, contracts, workflows and secrets jobs, for any commit
+  # (they used to run only after a push to main).
+  policy:
+    needs: setup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ needs.setup.outputs.source_ref }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Compare with main
+        id: base
+        run: |
+          set -euo pipefail
+          # A commit on main is compared with its first parent (what its push added);
+          # any other commit with where it left main.
+          if git merge-base --is-ancestor HEAD origin/main; then
+            base="$(git rev-parse -q --verify 'HEAD^1' || git rev-parse HEAD)"; on_main=true
+          else
+            base="$(git merge-base HEAD origin/main)"; on_main=false
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"; echo "on_main=$on_main" >> "$GITHUB_OUTPUT"
+          echo "comparing with $base (on main: $on_main)"
+      - name: Tools (kustomize, kubeconform, gitleaks, actionlint)
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/bin"; mkdir -p "$bin"; cd "$RUNNER_TEMP"
+          fetch() { curl -fsSL --retry 3 -o "$2" "$1"; }
+          fetch "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" kustomize.tgz
+          fetch "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/checksums.txt" kustomize.sums
+          grep " kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz\$" kustomize.sums | sed 's/ .*/  kustomize.tgz/' | sha256sum -c -
+          fetch "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" kubeconform.tgz
+          fetch "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/CHECKSUMS" kubeconform.sums
+          grep " kubeconform-linux-amd64.tar.gz\$" kubeconform.sums | sed 's/ .*/  kubeconform.tgz/' | sha256sum -c -
+          fetch "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" gitleaks.tgz
+          fetch "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_checksums.txt" gitleaks.sums
+          grep " gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz\$" gitleaks.sums | sed 's/ .*/  gitleaks.tgz/' | sha256sum -c -
+          fetch "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" actionlint.tgz
+          fetch "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_checksums.txt" actionlint.sums
+          grep " actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz\$" actionlint.sums | sed 's/ .*/  actionlint.tgz/' | sha256sum -c -
+          tar -xzf kustomize.tgz -C "$bin" kustomize
+          tar -xzf kubeconform.tgz -C "$bin" kubeconform
+          tar -xzf gitleaks.tgz -C "$bin" gitleaks
+          tar -xzf actionlint.tgz -C "$bin" actionlint
+          echo "$bin" >> "$GITHUB_PATH"
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: PyYAML
+        run: python -m pip install --quiet "pyyaml==$PYYAML_VERSION"
+
+      # secrets (gitleaks): only what this commit adds to main. The findings are redacted, and
+      # only the rule, file, line and commit are printed.
+      - name: gitleaks on the commits this change adds
+        if: ${{ !cancelled() }}
+        env:
+          BASE: ${{ steps.base.outputs.base }}
+        run: |
+          set -uo pipefail
+          range="$BASE..HEAD"; [ "$BASE" = "$(git rev-parse HEAD)" ] && range="-1 HEAD"
+          rc=0
+          gitleaks git --redact --no-banner --log-level warn --config .gitleaks.toml \
+            --report-format json --report-path "$RUNNER_TEMP/gitleaks.json" --log-opts="$range" . || rc=$?
+          if [ "$rc" -ne 0 ] && [ -s "$RUNNER_TEMP/gitleaks.json" ]; then
+            jq -r '.[] | "::error file=\(.File),line=\(.StartLine)::gitleaks \(.RuleID) in commit \(.Commit[0:12])"' "$RUNNER_TEMP/gitleaks.json"
+          fi
+          exit $rc
+
+      # deploy
+      - name: Chart, add-ons, release values, schemas, connection budget and pins
+        if: ${{ !cancelled() }}
+        run: scripts/ci/check-helm.sh
+      - name: Backend, chart and OpenTofu agree (PostgreSQL version, max_connections)
+        if: ${{ !cancelled() }}
+        run: python -I scripts/ci/check-infra-consistency.py
+      - name: A changed chart has a new version
+        if: ${{ !cancelled() && steps.base.outputs.on_main == 'false' }}
+        env:
+          BASE: ${{ steps.base.outputs.base }}
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet "$BASE" -- infra/helm/goodfood; then
+            old="$(git show "$BASE:infra/helm/goodfood/Chart.yaml" 2>/dev/null | awk '/^version:/{print $2}')"
+            new="$(awk '/^version:/{print $2}' infra/helm/goodfood/Chart.yaml)"
+            if [ -n "$old" ] && [ "$old" = "$new" ]; then
+              echo "::error file=infra/helm/goodfood/Chart.yaml::the chart changed but its version is still $new; bump it"
+              exit 1
+            fi
+          fi
+
+      # workflows
+      - name: actionlint
+        if: ${{ !cancelled() }}
+        run: actionlint -color
+      - name: Every action is pinned to a full commit SHA
+        if: ${{ !cancelled() }}
+        run: |
+          if grep -rnE '^\s*-?\s*uses:\s*[^./][^@]*@([^ #]{0,39}|[^ #]*[^0-9a-f ][^ #]*)(\s|$)' .github/workflows; then
+            echo "::error::pin every action to a 40-character commit SHA with the tag in a comment"
+            exit 1
+          fi
+
+      # contracts (Spectral, oasdiff through go run)
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: ${{ !cancelled() }}
+        with:
+          go-version-file: tests/go.mod
+          cache: false
+      - name: Cache Go builds (oasdiff)
+        if: ${{ !cancelled() }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: farm-policy-go-${{ runner.os }}-${{ hashFiles('scripts/contracts/breaking-check.sh', 'tests/go.mod') }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: ${{ !cancelled() }}
+        with:
+          node-version: 22
+      - name: Spectral and oasdiff (T3)
+        if: ${{ !cancelled() }}
+        run: scripts/contracts/breaking-check.sh --base "${{ steps.base.outputs.base }}"
+
+      # infra
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        if: ${{ !cancelled() }}
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+      - name: OpenTofu format
+        if: ${{ !cancelled() }}
+        run: tofu fmt -check -recursive infra/tofu
+      - name: Cache OpenTofu providers
+        if: ${{ !cancelled() }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: farm-tofu-${{ runner.os }}-${{ hashFiles('infra/tofu/**/.terraform.lock.hcl') }}
+          restore-keys: farm-tofu-${{ runner.os }}-
+      - name: Validate every OpenTofu root without a backend
+        if: ${{ !cancelled() }}
+        env:
+          TF_PLUGIN_CACHE_DIR: /home/runner/.terraform.d/plugin-cache
+        run: |
+          set -euo pipefail
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+          for root in infra/tofu/envs/*/; do
+            echo "::group::$root"
+            tofu -chdir="$root" init -backend=false -input=false -lockfile=readonly > /dev/null
+            tofu -chdir="$root" validate
+            echo "::endgroup::"
+          done
+      - uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+        if: ${{ !cancelled() }}
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+      - name: TFLint
+        if: ${{ !cancelled() }}
+        env:
+          # The farm's own read-only token, only for TFLint's plugin download rate limit.
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          cfg="$PWD/.tflint.hcl"
+          tflint --init --config "$cfg"
+          cd infra/tofu && tflint --recursive --config "$cfg"
+      - name: Configuration scan (Trivy)
+        if: ${{ !cancelled() }}
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: config
+          scan-ref: .
+          skip-dirs: .claude
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+      - name: Email ingest Worker tests
+        if: ${{ !cancelled() }}
+        working-directory: infra/cloudflare/workers/email-ingest
+        run: npm run check && npm test
+
+  report:
+    needs: [setup, rust, supply-chain, scripts, policy]
+    # Not on a cancelled run: a superseded run must not overwrite the status of the run that
+    # replaced it. A job that timed out still counts (its result is not success).
+    if: ${{ !cancelled() && needs.setup.outputs.source_ref != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Report the result to the private commit
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
+          SHA: ${{ needs.setup.outputs.source_ref }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SETUP: ${{ needs.setup.result }}
+          RUST: ${{ needs.rust.result }}
+          SUPPLY: ${{ needs.supply-chain.result }}
+          SCRIPTS: ${{ needs.scripts.result }}
+          POLICY: ${{ needs.policy.result }}
+        run: |
+          set -euo pipefail
+          if [ "$SETUP" = success ] && [ "$RUST" = success ] && [ "$SUPPLY" = success ] \
+             && [ "$SCRIPTS" = success ] && [ "$POLICY" = success ]; then
+            state=success; desc="Build farm checks passed"
+          else
+            state=failure; desc="rust=$RUST supply-chain=$SUPPLY scripts=$SCRIPTS policy=$POLICY"
+            [ "$SETUP" = success ] || desc="setup=$SETUP $desc"
+          fi
+          gh api "repos/$PRIVATE_REPO/statuses/$SHA" -X POST \
+            -f state="$state" -f context="$STATUS_CONTEXT" -f target_url="$RUN_URL" -f description="$desc" > /dev/null
+          echo "$STATUS_CONTEXT: $state ($desc)"
+          # This job succeeds once the status is posted; the run itself is red through the
+          # failing check job, so a failure shows once, where it happened.
+          {
+            echo "### $STATUS_CONTEXT: $state"
+            echo "$desc"
+          } >> "$GITHUB_STEP_SUMMARY"
