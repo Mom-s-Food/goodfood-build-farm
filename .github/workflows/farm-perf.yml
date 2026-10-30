@@ -1,0 +1,210 @@
+# Lane T8 of the private Mom-s-Food/goodfood-main repository on a public runner: the
+# Rust budget tests beside the code (scripts/test/req-coverage.py --lane-tests T8),
+# with GOODFOOD_PERF=1 in a release build, against a PostgreSQL on tmpfs set up as
+# farm-ci sets it up. Every measured budget prints one `T8-BUDGET | test | metric |
+# measured | budget | ok|OVER` line (platform_testkit::perf::report); the job collects
+# them into a timing report (the run summary and the `t8-timing-report` artifact) and
+# posts `farm/perf` to the private commit. It never touches `farm/ci`.
+#
+# A shared 4-vCPU hosted runner is noisier than production: a budget over on one run is
+# read against the report's runner line and the next run before it is called the code's
+# (docs/engineering/TESTING_STRATEGY.md, lane T8). Budgets live in the private
+# PERFORMANCE_GOALS.md and change only with the owner's approval.
+#
+# Logs are public: the tests' data is synthetic and nothing here prints a secret.
+name: farm-perf
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Full commit SHA of Mom-s-Food/goodfood-main; empty measures main'
+        required: false
+        default: ''
+  schedule:
+    # Mondays 06:17 UTC: main, weekly.
+    - cron: '17 6 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: farm-perf-${{ inputs.source_ref || 'main' }}
+  cancel-in-progress: true
+
+env:
+  PRIVATE_REPO: Mom-s-Food/goodfood-main
+  STATUS_CONTEXT: farm/perf
+
+jobs:
+  perf:
+    name: lane T8 (budget tests, release, GOODFOOD_PERF=1)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: never
+      GOODFOOD_TEST_DATABASE_URL: postgres://postgres:goodfood@localhost:5432/postgres?sslmode=disable
+    steps:
+      - name: Validate the request
+        env:
+          REQUESTED: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "$REQUESTED" ] && ! printf '%s' "$REQUESTED" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::source_ref must be a full lowercase commit SHA"; exit 1
+          fi
+      # The same throwaway server as farm-ci: data on tmpfs, no fsync, no full-page writes.
+      - name: Start PostgreSQL 18 (tmpfs, fsync off)
+        run: |
+          docker run -d --name pg -p 5432:5432 -e POSTGRES_PASSWORD=goodfood \
+            --tmpfs /var/lib/postgresql:rw,size=8g \
+            postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873 \
+            -c fsync=off -c synchronous_commit=off -c full_page_writes=off \
+            -c max_connections=300 -c shared_buffers=512MB > /dev/null
+      - name: Check out the private source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ inputs.source_ref || 'main' }}
+          persist-credentials: false
+      - name: Pin the exact commit
+        id: pin
+        run: printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Mark the private commit pending
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
+          SHA: ${{ steps.pin.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$PRIVATE_REPO/statuses/$SHA" -X POST \
+            -f state=pending -f context="$STATUS_CONTEXT" -f target_url="$RUN_URL" \
+            -f description="Lane T8 budgets running" > /dev/null
+      - name: Rust toolchain (stable)
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Restore the release dependency cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: backend
+          shared-key: farm-perf
+          cache-bin: "false"
+          # Only the weekly run of main saves, so branch runs never churn the repository cache.
+          save-if: ${{ github.event_name == 'schedule' }}
+      - name: The lane's tests
+        id: list
+        run: |
+          set -euo pipefail
+          python3 -I scripts/test/req-coverage.py --lane-tests T8 > "$RUNNER_TEMP/t8.tsv"
+          cat "$RUNNER_TEMP/t8.tsv"
+      - name: Build the tests (release)
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          while IFS=$'\t' read -r pkg tgt _; do
+            case "$tgt" in lib) f=(--lib) ;; bin) f=(--bins) ;; *) f=(--test "$tgt") ;; esac
+            echo "::group::build $pkg ($tgt)"
+            cargo test --release --locked --no-run -p "$pkg" "${f[@]}"
+            echo "::endgroup::"
+          done < "$RUNNER_TEMP/t8.tsv"
+      - name: Wait for PostgreSQL
+        run: |
+          for _ in $(seq 1 60); do
+            docker exec pg pg_isready -U postgres -h 127.0.0.1 > /dev/null 2>&1 && exit 0
+            sleep 1
+          done
+          docker logs pg; exit 1
+      # As scripts/test/run.sh --lane T8 runs them (one target at a time, one test thread,
+      # --include-ignored), plus --show-output so a passing test's measurements are kept.
+      # Every target runs even after one failed; each named test must report ok.
+      - name: Lane T8 (GOODFOOD_PERF=1)
+        id: run
+        working-directory: backend
+        env:
+          GOODFOOD_PERF: "1"
+        run: |
+          set -uo pipefail
+          logs="$RUNNER_TEMP/t8-logs"; mkdir -p "$logs"
+          : > "$RUNNER_TEMP/t8-results.tsv"
+          rc=0
+          while IFS=$'\t' read -r pkg tgt names; do
+            case "$tgt" in lib) f=(--lib) ;; bin) f=(--bins) ;; *) f=(--test "$tgt") ;; esac
+            IFS='|' read -ra want <<< "$names"
+            log="$logs/$pkg-$tgt.log"
+            echo "::group::$pkg ($tgt): $names"
+            start=$(date +%s)
+            cargo test --release --locked -p "$pkg" "${f[@]}" -- \
+              --include-ignored --test-threads=1 --show-output "${want[@]}" 2>&1 | tee "$log"
+            secs=$(( $(date +%s) - start ))
+            echo "::endgroup::"
+            for n in "${want[@]}"; do
+              if grep -qE -- "^test (.*::)?$n \.\.\. ok" "$log"; then r=passed
+              elif grep -qE -- "^test (.*::)?$n \.\.\. FAILED" "$log"; then r=failed; rc=1
+              else r="did not run"; rc=1; fi
+              printf '%s\t%s\t%s\t%s\t%s\n' "$pkg" "$tgt" "$n" "$r" "$secs" >> "$RUNNER_TEMP/t8-results.tsv"
+              [ "$r" = passed ] || echo "::error::T8 $pkg ($tgt) $n: $r"
+            done
+          done < "$RUNNER_TEMP/t8.tsv"
+          exit $rc
+      - name: Timing report
+        if: ${{ !cancelled() && steps.list.outcome == 'success' }}
+        env:
+          SHA: ${{ steps.pin.outputs.sha }}
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/t8-report"; mkdir -p "$out"
+          cp -r "$RUNNER_TEMP/t8-logs" "$out/logs" 2>/dev/null || true
+          {
+            echo "## Lane T8 timing report"
+            echo
+            echo "Commit \`$SHA\`, $(date -u +%Y-%m-%dT%H:%MZ)."
+            echo "Runner: $(nproc) vCPU, $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs),"
+            echo "$(awk '/MemTotal/ {printf "%.1f GB", $2/1048576}' /proc/meminfo) RAM; PostgreSQL 18 on tmpfs, fsync off."
+            echo
+            echo "### Budgets"
+            echo
+            echo "| Test | Metric | Measured | Budget | |"
+            echo "| --- | --- | --- | --- | --- |"
+            cat "$RUNNER_TEMP"/t8-logs/*.log 2>/dev/null | grep -h '^T8-BUDGET |' | sort -u \
+              | sed -e 's/^T8-BUDGET | /| /' -e 's/$/ |/'
+            echo
+            echo "### Tests"
+            echo
+            echo "| Package | Target | Test | Result | Target time (s) |"
+            echo "| --- | --- | --- | --- | --- |"
+            awk -F'\t' '{printf "| %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5}' "$RUNNER_TEMP/t8-results.tsv" 2>/dev/null
+          } > "$out/report.md"
+          cat "$out/report.md" >> "$GITHUB_STEP_SUMMARY"
+          cat "$out/report.md"
+      - name: Upload the timing report
+        if: ${{ !cancelled() && steps.list.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: t8-timing-report
+          path: ${{ runner.temp }}/t8-report
+          retention-days: 30
+      - name: Report the result to the private commit
+        if: ${{ !cancelled() && steps.pin.outputs.sha != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
+          SHA: ${{ steps.pin.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          OUTCOME: ${{ steps.run.outcome }}
+        run: |
+          set -euo pipefail
+          over=0; failed=0
+          if [ -f "$RUNNER_TEMP/t8-results.tsv" ]; then
+            failed=$(awk -F'\t' '$4 != "passed"' "$RUNNER_TEMP/t8-results.tsv" | wc -l)
+          fi
+          if ls "$RUNNER_TEMP"/t8-logs/*.log > /dev/null 2>&1; then
+            over=$(cat "$RUNNER_TEMP"/t8-logs/*.log | grep -h '^T8-BUDGET |' | sort -u | grep -c '| OVER$' || true)
+          fi
+          if [ "$OUTCOME" = success ]; then
+            state=success; desc="Lane T8 budgets met"
+          else
+            state=failure; desc="Lane T8: $failed test(s) failed or did not run, $over budget(s) over"
+          fi
+          gh api "repos/$PRIVATE_REPO/statuses/$SHA" -X POST \
+            -f state="$state" -f context="$STATUS_CONTEXT" -f target_url="$RUN_URL" -f description="$desc" > /dev/null
+          echo "$STATUS_CONTEXT: $state ($desc)"
