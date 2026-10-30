@@ -9,6 +9,8 @@ and works on one pinned commit.
 | --- | --- | --- |
 | `farm-ci.yml` | `repository_dispatch: trigger-ci`, or by hand with a commit SHA | fmt, clippy `-D warnings`, nextest with a PostgreSQL service, doc tests, contract drift, eval dataset check, cargo-deny and cargo-audit, script tests, infra consistency and links. Reports `farm/ci` as a commit status on the private commit. |
 | `farm-build.yml` | `repository_dispatch: trigger-build`, or by hand | Builds the `api` and `worker` images (arm64, for the OCI Ampere nodes) and pushes them to `ghcr.io/mom-s-food/goodfood-main/{api,worker}:<sha>`; uploads a release receipt with each digest. It never deploys. |
+| `farm-evals.yml` | By hand: `branch`, `mode` (`live` or `record`), `suite`, case and cost caps | Runs the evals command with the development key. `record` writes each answer to `backend/testdata/recordings/` and pushes one commit to the branch (never `main`). |
+| `farm-task.yml` | By hand: `branch` (never `main`), `task`, optional `suite` | One file-writing cargo task, pushed to the branch as one commit: `gen-cases` (the eval case generator; commits `evals/`), `write-recordings` (the synthetic recordings of the held-out split on the default grid, no key and no model call; commits `backend/testdata/recordings/` and `evals/`) or `fmt` (`cargo fmt --all`; commits `backend/`). A task that changes anything outside its paths fails and pushes nothing. |
 
 The private repository sends both dispatches on every push to `main`
 (`.github/workflows/farm-dispatch.yml` there).

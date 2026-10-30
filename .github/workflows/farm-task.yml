@@ -2,10 +2,17 @@
 # Mom-s-Food/goodfood-main repository and pushes the result back to that branch
 # as one commit. It exists because nobody builds the backend on a laptop (owner
 # rule, 2026-10-30): generated files that only a cargo run can produce are made
-# here. Tasks:
-#   gen-cases  cargo run -p goodfood-evals --bin gen_cases -- --root ../evals [--suite NAME]
-#   fmt        cargo fmt --all
-# Never runs on main, never on a tag, never anything but the two tasks above.
+# here. Tasks (each commits only the paths it owns; anything else changed fails the run):
+#   gen-cases         cargo run -p goodfood-evals --bin gen_cases -- --root ../evals [--suite NAME]
+#                     commits evals/
+#   write-recordings  cargo run -p goodfood-evals -- --root ../evals [--suite NAME]
+#                       --write-recordings testdata/recordings
+#                     the synthetic recordings (no key, no model call) of the held-out split on
+#                     the default grid; commits backend/testdata/recordings/ and evals/
+#   fmt               cargo fmt --all; commits backend/
+# Never runs on main, never on a tag, never anything but the three tasks above.
+# Cache: Swatinem/rust-cache as in farm-ci.yml (compiled dependencies only, no workspace
+# crates or incremental state), one shared entry per Cargo.lock and toolchain.
 name: farm-task
 
 on:
@@ -15,12 +22,12 @@ on:
         description: 'Branch of Mom-s-Food/goodfood-main (not main)'
         required: true
       task:
-        description: 'gen-cases or fmt'
+        description: 'gen-cases, write-recordings or fmt'
         required: true
         type: choice
-        options: [gen-cases, fmt]
+        options: [gen-cases, write-recordings, fmt]
       suite:
-        description: 'gen-cases only: one suite name; empty regenerates every suite the generator owns'
+        description: 'gen-cases and write-recordings: one suite name; empty does every suite'
         required: false
         default: ''
 
@@ -35,6 +42,8 @@ env:
   PRIVATE_REPO: Mom-s-Food/goodfood-main
   CARGO_TERM_COLOR: never
   CARGO_INCREMENTAL: "0"
+  # No debuginfo: smaller cache, faster link (as farm-ci.yml).
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
   task:
@@ -57,16 +66,12 @@ jobs:
           ref: ${{ inputs.branch }}
       - name: Rust toolchain (stable, with rustfmt)
         run: rustup toolchain install stable --profile minimal --component rustfmt --no-self-update
-      - name: Cache the cargo registry and target directory
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+      - name: Restore the dependency cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            backend/target
-          key: farm-task-${{ runner.os }}-${{ hashFiles('backend/Cargo.lock', 'backend/rust-toolchain.toml') }}
-          restore-keys: farm-task-${{ runner.os }}-
+          workspaces: backend
+          shared-key: farm-task
+          cache-bin: "false"
       - name: Run the task
         working-directory: backend
         env:
@@ -81,6 +86,12 @@ jobs:
               else
                 cargo run --quiet --locked -p goodfood-evals --bin gen_cases -- --root ../evals
               fi ;;
+            write-recordings)
+              if [ -n "$SUITE" ]; then
+                cargo run --quiet --locked -p goodfood-evals --bin evals -- --root ../evals --suite "$SUITE" --write-recordings testdata/recordings
+              else
+                cargo run --quiet --locked -p goodfood-evals --bin evals -- --root ../evals --write-recordings testdata/recordings
+              fi ;;
             fmt) cargo fmt --all ;;
           esac
       - name: Commit and push the result to the branch
@@ -92,6 +103,16 @@ jobs:
           set -euo pipefail
           if [ -z "$(git status --porcelain)" ]; then echo "nothing changed"; exit 0; fi
           git status --short
+          case $TASK in
+            gen-cases) owned='^(evals/)' ;;
+            write-recordings) owned='^(backend/testdata/recordings/|evals/)' ;;
+            fmt) owned='^(backend/)' ;;
+          esac
+          stray=$(git status --porcelain --untracked-files=all | cut -c4- | grep -Ev "$owned" || true)
+          if [ -n "$stray" ]; then
+            printf '%s\n' "$stray"
+            echo "::error::$TASK changed files outside the paths it owns; nothing pushed"; exit 1
+          fi
           git config user.name "goodfood-build-farm"
           git config user.email "goodfood-build-farm@users.noreply.github.com"
           git add -A
