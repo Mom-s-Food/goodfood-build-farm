@@ -11,16 +11,16 @@
 # is synthetic, and CARGO_TERM_COLOR=never keeps the logs plain; a compiler error
 # does quote the failing source lines, which the owner accepted (2026-11-03).
 #
-# Layout (every job after setup runs in parallel unless it needs another):
-#   setup ─┬─ rust-lint (fmt, clippy, api-types) ────────────────┐
-#          ├─ rust-build (nextest archive, doc tests, evals) ─ rust-test (1..3) ─ rust (aggregate)
-#          ├─ supply-chain (cargo-deny, cargo-audit)                              │
-#          ├─ scripts (every script suite, ShellCheck, site, design tokens)      │
-#          └─ policy (Helm/GitOps, OpenTofu, Trivy, contracts, workflows, gitleaks) ─ report
-# Speed: Swatinem/rust-cache keeps the compiled dependencies (saved from main only, so the
-# 10 GB repository cache is not churned by branches); no debuginfo keeps the target small;
-# the tests are compiled once, archived, and run in three partitions against a
-# PostgreSQL on tmpfs with fsync off.
+# Layout (every job after setup runs in parallel):
+#   setup ─┬─ rust-lint: fmt, clippy, generated api-types ──────────┬─ rust (aggregate) ─┐
+#          ├─ rust-test 1/3, 2/3, 3/3: build and run the tests, doc ┘                    │
+#          │  tests and the evaluation dataset check of a third of the packages each     │
+#          ├─ supply-chain: cargo-deny, cargo-audit ─────────────────────────────────────┤
+#          └─ scripts: every non-Rust check of the private ci.yml ──────────────────────┴─ report
+# Speed: Swatinem/rust-cache keeps the compiled dependencies of each job (small, because
+# no debuginfo; saved from runs of the main tip only, so branches do not churn the 10 GB
+# repository cache); the tests run in three partitions against a PostgreSQL on tmpfs
+# with fsync off.
 name: farm-ci-next
 
 on:
@@ -156,77 +156,25 @@ jobs:
         if: ${{ !cancelled() }}
         run: scripts/contracts/generate-rs.sh --check
 
-  rust-build:
-    name: rust / build tests, doc tests, evals
+  # The tests, doc tests and the evaluation dataset check in three partitions of whole
+  # packages, each compiled and run on its own runner (no test archive to ship around:
+  # 1.7 GB took longer to download than to build). Packages are balanced by their measured
+  # test time; a package missing from the table counts as small and still runs.
+  rust-test:
+    name: rust / tests ${{ matrix.partition }}/3
     needs: setup
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    env:
-      CARGO_INCREMENTAL: "0"
-      CARGO_TERM_COLOR: never
-      # No debuginfo: a panic still names its file and line; the target and the
-      # test archive shrink to a fraction.
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
-    steps:
-      - name: Check out the pinned private source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: ${{ env.PRIVATE_REPO }}
-          token: ${{ secrets.PRIVATE_REPO_PAT }}
-          ref: ${{ needs.setup.outputs.source_ref }}
-          persist-credentials: false
-      - name: Verify the source
-        env:
-          EXPECTED: ${{ needs.setup.outputs.source_ref }}
-        run: |
-          set -euo pipefail
-          [ "$(git rev-parse HEAD)" = "$EXPECTED" ]
-          [ -z "$(git status --porcelain)" ]
-      - name: Rust toolchain (stable)
-        run: rustup toolchain install stable --profile minimal --no-self-update
-      - name: cargo-nextest
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
-        with:
-          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
-      - name: Restore the test dependency cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          workspaces: backend
-          shared-key: farm-tests
-          cache-bin: "false"
-          save-if: ${{ needs.setup.outputs.on_main == 'true' }}
-      - name: Build every test binary once (nextest archive)
-        working-directory: backend
-        run: cargo nextest archive --workspace --locked --archive-file "$RUNNER_TEMP/nextest.tar.zst"
-      - name: Upload the test archive
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: nextest-archive
-          path: ${{ runner.temp }}/nextest.tar.zst
-          if-no-files-found: error
-          retention-days: 1
-          compression-level: 0
-      - name: Doc tests
-        if: ${{ !cancelled() }}
-        working-directory: backend
-        run: cargo test --workspace --doc --locked
-      - name: Evaluation suites are well formed (T5 dataset check)
-        if: ${{ !cancelled() }}
-        working-directory: backend
-        run: cargo run --quiet --locked -p goodfood-evals -- --root ../evals
-
-  rust-test:
-    name: rust / tests ${{ matrix.partition }}/3
-    needs: [setup, rust-build]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         partition: [1, 2, 3]
     env:
+      CARGO_INCREMENTAL: "0"
       CARGO_TERM_COLOR: never
+      # No debuginfo: a panic still names its file and line; the target shrinks to a fraction.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
       NEXTEST_HIDE_PROGRESS_BAR: "1"
       GOODFOOD_TEST_DATABASE_URL: postgres://postgres:goodfood@localhost:5432/postgres?sslmode=disable
       # The prompt and derivation ledger tests compare with main (they must not skip silently).
@@ -251,15 +199,63 @@ jobs:
           persist-credentials: false
           # The prompt-ledger and derivation-ledger tests compare with origin/main.
           fetch-depth: 0
+      - name: Verify the source
+        env:
+          EXPECTED: ${{ needs.setup.outputs.source_ref }}
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$EXPECTED" ]
+          [ -z "$(git status --porcelain)" ]
+      - name: Rust toolchain (stable)
+        run: rustup toolchain install stable --profile minimal --no-self-update
       - name: cargo-nextest
         uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
-      - name: Download the test archive
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - name: Restore the dependency cache of this partition
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          name: nextest-archive
-          path: ${{ runner.temp }}
+          workspaces: backend
+          shared-key: farm-tests-${{ matrix.partition }}
+          cache-bin: "false"
+          save-if: ${{ needs.setup.outputs.on_main == 'true' }}
+      - name: Packages of partition ${{ matrix.partition }}
+        id: part
+        working-directory: backend
+        env:
+          PARTITION: ${{ matrix.partition }}
+        run: |
+          set -euo pipefail
+          cargo metadata --no-deps --format-version 1 --locked > "$RUNNER_TEMP/metadata.json"
+          python3 -I - "$RUNNER_TEMP/metadata.json" "$PARTITION" 3 > "$RUNNER_TEMP/part.txt" <<'PY'
+          import json, sys
+          meta, k, n = json.load(open(sys.argv[1])), int(sys.argv[2]), int(sys.argv[3])
+          # Summed test seconds per package (farm run 41111807233, 2026-10-30); 3 for any other.
+          weight = {"rest": 248, "foods": 209, "agent": 201, "coach": 110, "kitchen": 105,
+                    "logging": 99, "app": 97, "intent": 58, "imports": 49, "platform-jobs": 45,
+                    "goals": 40, "planner": 38, "identity": 37, "preferences": 31, "profile": 24,
+                    "platform-db": 16, "platform-httpx": 16, "analytics": 14, "privacy": 12,
+                    "shopping": 11, "evals": 10, "platform-ai": 8}
+          pkgs = sorted(meta["packages"], key=lambda p: (-weight.get(p["name"], 3), p["name"]))
+          parts, load = [[] for _ in range(n)], [0] * n
+          for p in pkgs:  # heaviest first, each to the lightest partition
+              i = min(range(n), key=lambda j: (load[j], j))
+              parts[i].append(p)
+              load[i] += weight.get(p["name"], 3)
+          mine = parts[k - 1]
+          def sel(ps):
+              return " ".join("-p " + p["name"] for p in ps)
+          libs = [p for p in mine if any("lib" in t["kind"] for t in p["targets"])]
+          print(f"packages={sel(mine)}")
+          print(f"libs={sel(libs)}")
+          print(f"evals={'true' if any(p['name'] == 'goodfood-evals' for p in mine) else 'false'}")
+          print(f"load={load[k - 1]} of {sum(load)}")
+          PY
+          cat "$RUNNER_TEMP/part.txt"
+          cat "$RUNNER_TEMP/part.txt" >> "$GITHUB_OUTPUT"
+      - name: Build the tests
+        working-directory: backend
+        run: cargo nextest run --locked --no-run ${{ steps.part.outputs.packages }}
       - name: Wait for PostgreSQL
         run: |
           for _ in $(seq 1 60); do
@@ -267,15 +263,22 @@ jobs:
             sleep 1
           done
           docker logs pg; exit 1
-      - name: Tests (T1, T2), partition ${{ matrix.partition }} of 3
-        run: |
-          cargo nextest run --archive-file "$RUNNER_TEMP/nextest.tar.zst" --workspace-remap backend \
-            --partition "count:${{ matrix.partition }}/3" --no-fail-fast --no-tests=pass
+      - name: Tests (T1, T2)
+        working-directory: backend
+        run: cargo nextest run --locked --no-fail-fast --no-tests=pass ${{ steps.part.outputs.packages }}
+      - name: Doc tests
+        if: ${{ !cancelled() && steps.part.outputs.libs != '' }}
+        working-directory: backend
+        run: cargo test --doc --locked ${{ steps.part.outputs.libs }}
+      - name: Evaluation suites are well formed (T5 dataset check)
+        if: ${{ !cancelled() && steps.part.outputs.evals == 'true' }}
+        working-directory: backend
+        run: cargo run --quiet --locked -p goodfood-evals -- --root ../evals
 
   rust:
     # The aggregate the farm/ci description names: fmt, clippy, api-types, every test
     # partition, doc tests and the evaluation dataset check.
-    needs: [setup, rust-lint, rust-build, rust-test]
+    needs: [setup, rust-lint, rust-test]
     if: ${{ !cancelled() && needs.setup.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -283,11 +286,10 @@ jobs:
       - name: Every Rust job passed
         env:
           LINT: ${{ needs.rust-lint.result }}
-          BUILD: ${{ needs.rust-build.result }}
           TEST: ${{ needs.rust-test.result }}
         run: |
-          echo "fmt/clippy/api-types=$LINT build/doc-tests/evals=$BUILD tests=$TEST"
-          [ "$LINT" = success ] && [ "$BUILD" = success ] && [ "$TEST" = success ]
+          echo "fmt/clippy/api-types=$LINT tests/doc-tests/evals=$TEST"
+          [ "$LINT" = success ] && [ "$TEST" = success ]
 
   supply-chain:
     needs: setup
@@ -312,78 +314,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo audit --file backend/Cargo.lock --ignore RUSTSEC-2023-0071
 
-  # Every script check of the private ci.yml (its scripts and docs jobs) plus the farm's own.
+  # Every check of the private ci.yml that is not Rust (its scripts, docs, deploy, infra,
+  # contracts, workflows and secrets jobs) plus the farm's own. Each step runs even when an
+  # earlier one failed, so one run reports every problem.
   scripts:
-    needs: setup
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: ${{ env.PRIVATE_REPO }}
-          token: ${{ secrets.PRIVATE_REPO_PAT }}
-          ref: ${{ needs.setup.outputs.source_ref }}
-          persist-credentials: false
-          fetch-depth: 0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.13"
-      - name: PyYAML
-        run: python -m pip install --quiet "pyyaml==$PYYAML_VERSION"
-      - name: Python unit tests
-        if: ${{ !cancelled() }}
-        run: |
-          rc=0
-          for d in scripts/test scripts/lib scripts/ci scripts/secrets; do
-            for p in 'test_*.py' '*_test.py'; do
-              if compgen -G "$d/$p" > /dev/null; then
-                echo "::group::$d $p"
-                python -I -m unittest discover -s "$d" -p "$p" || { rc=1; echo "::error::python tests failed in $d ($p)"; }
-                echo "::endgroup::"
-              fi
-            done
-          done
-          exit $rc
-      - name: Shell test suites (every suite runs; failures are collected)
-        if: ${{ !cancelled() }}
-        run: |
-          rc=0; failed=()
-          while IFS= read -r t; do
-            echo "::group::$t"
-            if ! bash "$t"; then rc=1; failed+=("$t"); fi
-            echo "::endgroup::"
-          done < <(find scripts -name '*_test.sh' | sort)
-          for t in "${failed[@]}"; do echo "::error file=$t::$t failed"; done
-          exit $rc
-      - name: ShellCheck
-        if: ${{ !cancelled() }}
-        run: git ls-files -z 'scripts/*.sh' 'scripts/dev/hooks/*' | xargs -0 shellcheck -x -S warning
-      - name: Secrets inventory is valid (no values, known vaults, rotation fields)
-        if: ${{ !cancelled() }}
-        run: bash scripts/secrets/check.sh
-      - name: Public site structure, links and draft banners
-        if: ${{ !cancelled() }}
-        run: python -I scripts/ci/check-site.py
-      - name: Relative links and anchors
-        if: ${{ !cancelled() }}
-        run: python -I scripts/ci/check-links.py
-      - name: Requirement coverage listing
-        if: ${{ !cancelled() }}
-        run: python -I scripts/test/req-coverage.py --lane-tests T8 > /dev/null
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        if: ${{ !cancelled() }}
-        with:
-          go-version-file: scripts/design/gen-tokens/go.mod
-          cache: false
-      - name: Design tokens are generated and accessible
-        if: ${{ !cancelled() }}
-        run: |
-          go -C scripts/design/gen-tokens test -race -count=1 ./...
-          go -C scripts/design/gen-tokens run . --check
-
-  # The private ci.yml's deploy, infra, contracts, workflows and secrets jobs, for any commit
-  # (they used to run only after a push to main).
-  policy:
     needs: setup
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -439,6 +373,57 @@ jobs:
       - name: PyYAML
         run: python -m pip install --quiet "pyyaml==$PYYAML_VERSION"
 
+      # scripts
+      - name: Python unit tests
+        if: ${{ !cancelled() }}
+        run: |
+          rc=0
+          for d in scripts/test scripts/lib scripts/ci scripts/secrets; do
+            for p in 'test_*.py' '*_test.py'; do
+              if compgen -G "$d/$p" > /dev/null; then
+                echo "::group::$d $p"
+                python -I -m unittest discover -s "$d" -p "$p" || { rc=1; echo "::error::python tests failed in $d ($p)"; }
+                echo "::endgroup::"
+              fi
+            done
+          done
+          exit $rc
+      - name: Shell test suites (every suite runs; failures are collected)
+        if: ${{ !cancelled() }}
+        run: |
+          rc=0; failed=()
+          while IFS= read -r t; do
+            echo "::group::$t"
+            if ! bash "$t"; then rc=1; failed+=("$t"); fi
+            echo "::endgroup::"
+          done < <(find scripts -name '*_test.sh' | sort)
+          for t in "${failed[@]}"; do echo "::error file=$t::$t failed"; done
+          exit $rc
+      - name: ShellCheck
+        if: ${{ !cancelled() }}
+        run: git ls-files -z 'scripts/*.sh' 'scripts/dev/hooks/*' | xargs -0 shellcheck -x -S warning
+      - name: Secrets inventory is valid (no values, known vaults, rotation fields)
+        if: ${{ !cancelled() }}
+        run: bash scripts/secrets/check.sh
+      - name: Public site structure, links and draft banners
+        if: ${{ !cancelled() }}
+        run: python -I scripts/ci/check-site.py
+      - name: Relative links and anchors
+        if: ${{ !cancelled() }}
+        run: python -I scripts/ci/check-links.py
+      - name: Requirement coverage listing
+        if: ${{ !cancelled() }}
+        run: python -I scripts/test/req-coverage.py --lane-tests T8 > /dev/null
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: ${{ !cancelled() }}
+        with:
+          go-version-file: scripts/design/gen-tokens/go.mod
+          cache: false
+      - name: Design tokens are generated and accessible
+        if: ${{ !cancelled() }}
+        run: |
+          go -C scripts/design/gen-tokens test -race -count=1 ./...
+          go -C scripts/design/gen-tokens run . --check
       # secrets (gitleaks): only what this commit adds to main. The findings are redacted, and
       # only the rule, file, line and commit are printed.
       - name: gitleaks on the commits this change adds
@@ -570,7 +555,7 @@ jobs:
         run: npm run check && npm test
 
   report:
-    needs: [setup, rust, supply-chain, scripts, policy]
+    needs: [setup, rust, supply-chain, scripts]
     # Not on a cancelled run: a superseded run must not overwrite the status of the run that
     # replaced it. A job that timed out still counts (its result is not success).
     if: ${{ !cancelled() && needs.setup.outputs.source_ref != '' }}
@@ -586,14 +571,13 @@ jobs:
           RUST: ${{ needs.rust.result }}
           SUPPLY: ${{ needs.supply-chain.result }}
           SCRIPTS: ${{ needs.scripts.result }}
-          POLICY: ${{ needs.policy.result }}
         run: |
           set -euo pipefail
           if [ "$SETUP" = success ] && [ "$RUST" = success ] && [ "$SUPPLY" = success ] \
-             && [ "$SCRIPTS" = success ] && [ "$POLICY" = success ]; then
+             && [ "$SCRIPTS" = success ]; then
             state=success; desc="Build farm checks passed"
           else
-            state=failure; desc="rust=$RUST supply-chain=$SUPPLY scripts=$SCRIPTS policy=$POLICY"
+            state=failure; desc="rust=$RUST supply-chain=$SUPPLY scripts=$SCRIPTS"
             [ "$SETUP" = success ] || desc="setup=$SETUP $desc"
           fi
           gh api "repos/$PRIVATE_REPO/statuses/$SHA" -X POST \
