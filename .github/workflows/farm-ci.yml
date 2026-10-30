@@ -500,6 +500,15 @@ jobs:
       - name: Spectral and oasdiff (T3)
         if: ${{ !cancelled() }}
         run: scripts/contracts/breaking-check.sh --base "${{ steps.base.outputs.base }}"
+      - name: Black-box journeys compile (tests/, go vet and go build; nothing runs against a server)
+        if: ${{ !cancelled() }}
+        working-directory: tests
+        run: |
+          set -euo pipefail
+          test -z "$(gofmt -l .)" || { gofmt -l .; echo "::error::gofmt the files above"; exit 1; }
+          go vet ./...
+          go build ./...
+          go test -count=1 -run '^$' ./...
 
       # infra
       - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
