@@ -1,11 +1,13 @@
 # Builds the backend images of one private goodfood-main commit on public runners
 # and pushes them to the private GHCR packages (ghcr.io/mom-s-food/goodfood-main/
-# api and worker). OCI pulls them by digest; this workflow never deploys. The
-# deploy step joins once the OCI pay-as-you-go tenancy is ready and the owner has
-# approved it (AGENTS.md: production deploys need the owner's approval).
+# api and worker), publishes the Helm chart when its version is new, and, for a
+# commit that is still the tip of main and has passed farm/ci, pins the new
+# digests in infra/deploy/staging on main. Flux on the staging node deploys from
+# there (ADR-0017, ADR-0018). Production is never touched here (AGENTS.md:
+# production deploys need the owner's approval).
 #
 # arm64 only: the OCI nodes are Ampere A1. Each run uploads a release receipt with
-# the source commit and the image digests; that is what a deploy reads.
+# the source commit and the image digests.
 name: farm-build
 
 on:
@@ -29,6 +31,8 @@ env:
   PRIVATE_REPO: Mom-s-Food/goodfood-main
   REGISTRY: ghcr.io
   IMAGE_BASE: ghcr.io/mom-s-food/goodfood-main
+  CHART_REPO: oci://ghcr.io/mom-s-food/goodfood-main/charts
+  HELM_VERSION: v3.22.0
 
 jobs:
   setup:
@@ -117,3 +121,109 @@ jobs:
           path: ${{ runner.temp }}/release/${{ matrix.target }}.json
           if-no-files-found: error
           retention-days: 30
+
+  chart:
+    needs: setup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.push.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ needs.setup.outputs.source_ref }}
+          persist-credentials: false
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - name: Publish the chart if this version is new
+        id: push
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
+        run: |
+          set -euo pipefail
+          # The output always carries Chart.yaml's version, so a version published by an
+          # earlier run that never reached staging is still pinned.
+          version="$(awk '/^version:/{print $2}' infra/helm/goodfood/Chart.yaml)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "$GH_TOKEN" | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
+          if out="$(helm show chart "$CHART_REPO/goodfood" --version "$version" 2>&1)"; then
+            echo "chart $version is already published"
+            exit 0
+          fi
+          # Push only on a genuine not-found; any other error (auth, network) fails
+          # instead of overwriting a published version.
+          if ! grep -qiE 'not found|manifest unknown|404' <<<"$out"; then
+            echo "::error::could not check whether chart $version exists"
+            exit 1
+          fi
+          helm package infra/helm/goodfood --destination "$RUNNER_TEMP"
+          helm push "$RUNNER_TEMP/goodfood-$version.tgz" "$CHART_REPO"
+
+  deploy-staging:
+    needs: [setup, images, chart]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    concurrency:
+      group: farm-deploy-staging
+      cancel-in-progress: false
+    steps:
+      - name: Only the tip of main, and only once farm/ci has passed
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
+          SHA: ${{ needs.setup.outputs.source_ref }}
+        run: |
+          set -euo pipefail
+          tip="$(gh api "repos/$PRIVATE_REPO/commits/main" --jq .sha)"
+          if [ "$tip" != "$SHA" ]; then
+            echo "::notice::$SHA is not the tip of main ($tip); staging is not bumped"
+            echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # farm-ci runs in parallel; wait for its farm/ci status (up to an hour).
+          for _ in $(seq 1 60); do
+            state="$(gh api "repos/$PRIVATE_REPO/commits/$SHA/statuses"               --jq '[.[] | select(.context == "farm/ci")][0].state // "missing"')"
+            case $state in
+              success) echo "go=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
+              failure | error) echo "::error::farm/ci is $state for $SHA; staging is not bumped"; exit 1 ;;
+            esac
+            sleep 60
+          done
+          echo "::error::farm/ci did not finish within an hour"; exit 1
+      - if: steps.gate.outputs.go == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          path: ${{ runner.temp }}/release
+          merge-multiple: true
+      - if: steps.gate.outputs.go == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: main
+          fetch-depth: 0
+      - name: Pin the new digests and chart on main
+        if: steps.gate.outputs.go == 'true'
+        env:
+          SHA: ${{ needs.setup.outputs.source_ref }}
+          CHART: ${{ needs.chart.outputs.version }}
+        run: |
+          set -euo pipefail
+          digest() { jq -r .image "$RUNNER_TEMP/release/$1.json" | sed 's/.*@//'; }
+          jq -n --arg api "$(digest api)" --arg worker "$(digest worker)" --arg chart "$CHART"             '{"api-digest": $api, "worker-digest": $worker, "chart-version": $chart}' > "$RUNNER_TEMP/pins.json"
+          cat "$RUNNER_TEMP/pins.json"
+          changed="$(python3 -I scripts/lib/pins.py apply "$RUNNER_TEMP/pins.json" infra/deploy/staging/release.yaml)"
+          if [ -z "$changed" ]; then echo "staging already runs $SHA"; exit 0; fi
+          bash scripts/ci/check-deploy-pins.sh --env staging
+          git config user.name "goodfood-build-farm"
+          git config user.email "goodfood-build-farm@users.noreply.github.com"
+          # [skip ci] keeps this commit from dispatching the farm again (no loop).
+          git commit -am "deploy(staging): ${SHA:0:12} [skip ci]" -m "Source-Commit: $SHA"
+          for _ in 1 2 3; do
+            git push origin HEAD:main && exit 0
+            git pull --rebase origin main
+          done
+          echo "::error::could not push the staging pins to main"; exit 1
