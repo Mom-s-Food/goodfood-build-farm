@@ -124,7 +124,8 @@ jobs:
         env:
           GOODFOOD_PERF: "1"
         run: |
-          set -uo pipefail
+          # The default shell is bash -e: a failing target must not end the step early.
+          set +e -uo pipefail
           logs="$RUNNER_TEMP/t8-logs"; mkdir -p "$logs"
           : > "$RUNNER_TEMP/t8-results.tsv"
           rc=0
@@ -152,7 +153,8 @@ jobs:
         env:
           SHA: ${{ steps.pin.outputs.sha }}
         run: |
-          set -uo pipefail
+          # The default shell is bash -e: a failing target must not end the step early.
+          set +e -uo pipefail
           out="$RUNNER_TEMP/t8-report"; mkdir -p "$out"
           cp -r "$RUNNER_TEMP/t8-logs" "$out/logs" 2>/dev/null || true
           {
