@@ -178,6 +178,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       NEXTEST_HIDE_PROGRESS_BAR: "1"
+      NEXTEST_TEST_THREADS: "8"
       GOODFOOD_TEST_DATABASE_URL: postgres://postgres:goodfood@localhost:5432/postgres?sslmode=disable
       # The prompt and derivation ledger tests compare with main (they must not skip silently).
       GOODFOOD_DERIVATION_BASE: origin/main
@@ -232,13 +233,15 @@ jobs:
           python3 -I - "$RUNNER_TEMP/metadata.json" "$PARTITION" 3 > "$RUNNER_TEMP/part.txt" <<'PY'
           import json, sys
           meta, k, n = json.load(open(sys.argv[1])), int(sys.argv[2]), int(sys.argv[3])
-          # Summed test seconds per package (farm run 41111807233, 2026-10-30); 3 for any other.
-          # goodfood-evals stands for the evaluation dataset check (about 40 s on 4 threads).
-          weight = {"rest": 248, "foods": 209, "agent": 201, "coach": 110, "kitchen": 105,
-                    "logging": 99, "app": 97, "intent": 58, "imports": 49, "platform-jobs": 45,
-                    "goals": 40, "planner": 38, "identity": 37, "preferences": 31, "profile": 24,
-                    "platform-db": 16, "platform-httpx": 16, "analytics": 14, "privacy": 12,
-                    "shopping": 11, "evals": 10, "platform-ai": 8, "goodfood-evals": 160}
+          # Summed test seconds per package (farm runs 41111807233 and 41116118848); 3 for any
+          # other. rest adds about 300 for its build (it depends on nearly every crate), and
+          # goodfood-evals stands for the evaluation dataset check (25-40 s).
+          weight = {"rest": 590, "foods": 209, "agent": 201, "kitchen": 120, "coach": 110,
+                    "app": 110, "logging": 99, "intent": 58, "imports": 49, "goals": 46,
+                    "platform-jobs": 45, "planner": 38, "identity": 37, "preferences": 36,
+                    "profile": 24, "analytics": 16, "platform-db": 16, "platform-httpx": 16,
+                    "shopping": 13, "privacy": 12, "evals": 10, "platform-ai": 8,
+                    "goodfood-evals": 120}
           pkgs = sorted(meta["packages"], key=lambda p: (-weight.get(p["name"], 3), p["name"]))
           parts, load = [[] for _ in range(n)], [0] * n
           for p in pkgs:  # heaviest first, each to the lightest partition
