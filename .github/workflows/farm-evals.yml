@@ -1,0 +1,212 @@
+# Runs the AI evaluation suites (lane T5) of the private Mom-s-Food/goodfood-main repository against
+# the real Claude API with the development key (ANTHROPIC_API_KEY_DEV, its own Anthropic workspace
+# with a spend cap). Every run costs money, so it starts only by hand, one at a time, with a case cap
+# and a hard cost cap (`evals --max-cost-usd`: no call is sent once the run has spent that much).
+#   live    score the suites live; the report goes to the run summary and an artifact; no commit
+#   record  the same calls, each answer written to backend/testdata/recordings and pushed to the
+#           given branch as one commit (never main), like farm-task.yml
+#
+# Logs of a public repository are public. The key reaches only the evals step, through its
+# environment, and is never printed. The evals command never prints a prompt, a case or a model
+# answer: its report holds scores, counts, tokens and cost, and its failure reasons are codes and
+# field names (backend/crates/evals/README.md). The report is printed and kept as an artifact.
+name: farm-evals
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch of Mom-s-Food/goodfood-main (record mode: not main)'
+        required: true
+        default: main
+      mode:
+        description: 'live (score only) or record (also commit the recordings to the branch)'
+        required: true
+        type: choice
+        options: [live, record]
+        default: live
+      suite:
+        description: 'One suite name; empty runs every suite that has a runner'
+        required: false
+        default: ''
+      max_cases:
+        description: 'At most this many cases per suite (cost control); empty means every case on the split'
+        required: false
+        default: '3'
+      cases:
+        description: 'Optional comma-separated case ids (only these run)'
+        required: false
+        default: ''
+      split:
+        description: 'heldout (gates), dev or all'
+        required: true
+        type: choice
+        options: [heldout, dev, all]
+        default: heldout
+      models:
+        description: 'Comma-separated models (each one is a pair with each effort)'
+        required: true
+        default: claude-haiku-5-5
+      efforts:
+        description: 'Comma-separated efforts'
+        required: true
+        default: low
+      repeats:
+        description: 'Runs of each case on each pair'
+        required: true
+        default: '1'
+      max_cost_usd:
+        description: 'Hard cost cap of the run in USD (at most 50); the run stops before the next call once it is spent'
+        required: true
+        default: '2'
+
+permissions:
+  contents: read
+
+# One paid run at a time across the whole farm; a queued run waits, never cancels a running one.
+concurrency:
+  group: farm-evals
+  cancel-in-progress: false
+
+env:
+  PRIVATE_REPO: Mom-s-Food/goodfood-main
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  evals:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Validate the request
+        env:
+          BRANCH: ${{ inputs.branch }}
+          MODE: ${{ inputs.mode }}
+          SUITE: ${{ inputs.suite }}
+          MAX_CASES: ${{ inputs.max_cases }}
+          CASES: ${{ inputs.cases }}
+          MODELS: ${{ inputs.models }}
+          EFFORTS: ${{ inputs.efforts }}
+          REPEATS: ${{ inputs.repeats }}
+          MAX_COST: ${{ inputs.max_cost_usd }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$BRANCH" | grep -Eq '^[A-Za-z0-9._/-]{1,100}$' || { echo "::error::bad branch name"; exit 1; }
+          case $BRANCH in refs/*) echo "::error::give a branch name, not a ref"; exit 1 ;; esac
+          if [ "$MODE" = record ]; then
+            case $BRANCH in main | */main) echo "::error::record mode refuses to write to $BRANCH"; exit 1 ;; esac
+          fi
+          [ -z "$SUITE" ] || printf '%s' "$SUITE" | grep -Eq '^[a-z0-9-]{1,40}$' || { echo "::error::bad suite name"; exit 1; }
+          [ -z "$MAX_CASES" ] || printf '%s' "$MAX_CASES" | grep -Eq '^[1-9][0-9]{0,3}$' || { echo "::error::max_cases must be 1 to 9999 or empty"; exit 1; }
+          [ -z "$CASES" ] || printf '%s' "$CASES" | grep -Eq '^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+){0,49}$' || { echo "::error::cases must be comma-separated case ids"; exit 1; }
+          printf '%s' "$MODELS" | grep -Eq '^claude-[a-z0-9-]+(,claude-[a-z0-9-]+){0,4}$' || { echo "::error::models must be comma-separated claude-* names"; exit 1; }
+          printf '%s' "$EFFORTS" | grep -Eq '^(low|medium|high|xhigh|max)(,(low|medium|high|xhigh|max)){0,4}$' || { echo "::error::bad efforts"; exit 1; }
+          printf '%s' "$REPEATS" | grep -Eq '^[1-5]$' || { echo "::error::repeats must be 1 to 5"; exit 1; }
+          printf '%s' "$MAX_COST" | grep -Eq '^[0-9]{1,2}(\.[0-9]{1,2})?$' || { echo "::error::max_cost_usd must be a number such as 2 or 0.50"; exit 1; }
+          awk -v c="$MAX_COST" 'BEGIN { exit !(c > 0 && c <= 50) }' || { echo "::error::max_cost_usd must be above 0 and at most 50"; exit 1; }
+      - name: Check out the private source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ inputs.branch }}
+          # Only record mode pushes; a live run keeps no credential on disk.
+          persist-credentials: ${{ inputs.mode == 'record' }}
+      - name: Rust toolchain (stable)
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Cache the cargo registry and target directory
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            backend/target
+          key: farm-evals-${{ runner.os }}-${{ hashFiles('backend/Cargo.lock', 'backend/rust-toolchain.toml') }}
+          restore-keys: |
+            farm-evals-${{ runner.os }}-
+            farm-rust-${{ runner.os }}-
+      - name: Build the evals command
+        working-directory: backend
+        run: cargo build --quiet --locked -p goodfood-evals --bin evals
+      - name: Run the suites (calls the Claude API; costs money)
+        id: run
+        working-directory: backend
+        env:
+          # The key exists only in this step's environment; nothing below prints it.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY_DEV }}
+          BRANCH: ${{ inputs.branch }}
+          MODE: ${{ inputs.mode }}
+          SUITE: ${{ inputs.suite }}
+          MAX_CASES: ${{ inputs.max_cases }}
+          CASES: ${{ inputs.cases }}
+          SPLIT: ${{ inputs.split }}
+          MODELS: ${{ inputs.models }}
+          EFFORTS: ${{ inputs.efforts }}
+          REPEATS: ${{ inputs.repeats }}
+          MAX_COST: ${{ inputs.max_cost_usd }}
+        run: |
+          set -euo pipefail
+          [ -n "$ANTHROPIC_API_KEY" ] || { echo "::error::the ANTHROPIC_API_KEY_DEV secret is not set on this repository"; exit 1; }
+          out="$RUNNER_TEMP/evals-report"
+          mkdir -p "$out"
+          args=(--root ../evals --run --mode "$MODE" --split "$SPLIT" --models "$MODELS" --efforts "$EFFORTS"
+                --repeats "$REPEATS" --max-cost-usd "$MAX_COST" --json "$out/report.json")
+          [ -z "$SUITE" ] || args+=(--suite "$SUITE")
+          [ -z "$MAX_CASES" ] || args+=(--max-cases "$MAX_CASES")
+          [ -z "$CASES" ] || args+=(--cases "$CASES")
+          printf 'evals %s\nsource %s at %s\n' "${args[*]}" "$BRANCH" "$(git rev-parse HEAD)" > "$out/command.txt"
+          set +e
+          ./target/debug/evals "${args[@]}" > "$out/report.txt" 2> "$out/stderr.txt"
+          code=$?
+          set -e
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "exit code $code" >> "$out/command.txt"
+          # Scores, counts, tokens and cost only (no prompt, case or answer text): safe to print.
+          cat "$out/command.txt" "$out/report.txt" "$out/stderr.txt"
+          {
+            echo "### farm-evals: $MODE on \`$BRANCH\` ($(git rev-parse --short HEAD)), exit $code"
+            echo
+            echo '```'
+            cat "$out/command.txt"
+            grep -E '^evals: (cost|stopped)' "$out/stderr.txt" || true
+            echo
+            cat "$out/report.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the report
+        if: ${{ always() && steps.run.outcome != 'skipped' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: evals-report-${{ inputs.mode }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/evals-report/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Commit and push the recordings to the branch
+        if: ${{ inputs.mode == 'record' && steps.run.outcome == 'success' }}
+        env:
+          BRANCH: ${{ inputs.branch }}
+          SUITE: ${{ inputs.suite }}
+        run: |
+          set -euo pipefail
+          # The run may stop at its cost cap; what it recorded until then is kept.
+          other=$(git status --porcelain -- . ':!backend/testdata/recordings')
+          if [ -n "$other" ]; then echo "::error::the run changed files outside backend/testdata/recordings"; echo "$other"; exit 1; fi
+          if [ -z "$(git status --porcelain -- backend/testdata/recordings)" ]; then echo "nothing recorded"; exit 0; fi
+          git status --short -- backend/testdata/recordings
+          git config user.name "goodfood-build-farm"
+          git config user.email "goodfood-build-farm@users.noreply.github.com"
+          git add -A -- backend/testdata/recordings
+          git commit -q -m "chore(farm): record evals${SUITE:+ --suite $SUITE}" -m "Recorded by goodfood-build-farm farm-evals.yml run ${{ github.run_id }}."
+          for _ in 1 2 3; do
+            git push origin "HEAD:$BRANCH" && exit 0
+            git pull --rebase origin "$BRANCH"
+          done
+          echo "::error::could not push to $BRANCH"; exit 1
+      - name: Fail when the evals command failed
+        if: ${{ steps.run.outputs.code != '0' }}
+        env:
+          CODE: ${{ steps.run.outputs.code }}
+        run: |
+          echo "::error::evals exited $CODE (1: a failed run, including a stop at the cost cap; 2: a usage error); see the report above"
+          exit 1
