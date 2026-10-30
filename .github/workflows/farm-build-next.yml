@@ -73,7 +73,16 @@ jobs:
           token: ${{ secrets.PRIVATE_REPO_PAT }}
           ref: ${{ needs.setup.outputs.source_ref }}
           persist-credentials: false
+      # The binaries depend only on backend/ (Dockerfile included) and the contract; a commit
+      # that changes neither reuses the binaries built for an earlier one.
+      - name: Binaries built from the same sources
+        id: bins
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/dist/out
+          key: farm-bins-v1-${{ env.RUST_TARGET }}-${{ hashFiles('backend/**', 'contracts/openapi/**') }}
       - name: The toolchain backend/Dockerfile pins
+        if: steps.bins.outputs.cache-hit != 'true'
         id: pins
         run: |
           set -euo pipefail
@@ -85,12 +94,14 @@ jobs:
           echo "rust=$rust zig=$zig cargo-zigbuild=$zigbuild"
           { echo "rust=$rust"; echo "zig=$zig"; echo "zigbuild=$zigbuild"; } >> "$GITHUB_OUTPUT"
       - name: Rust ${{ steps.pins.outputs.rust }} for ${{ env.RUST_TARGET }}
+        if: steps.bins.outputs.cache-hit != 'true'
         env:
           RUST_VERSION: ${{ steps.pins.outputs.rust }}
         run: |
           rustup toolchain install "$RUST_VERSION" --profile minimal --target "$RUST_TARGET" --no-self-update
           echo "RUSTUP_TOOLCHAIN=$RUST_VERSION" >> "$GITHUB_ENV"
       - name: Zig ${{ steps.pins.outputs.zig }}
+        if: steps.bins.outputs.cache-hit != 'true'
         env:
           ZIG_VERSION: ${{ steps.pins.outputs.zig }}
         run: |
@@ -98,16 +109,19 @@ jobs:
           "$RUNNER_TEMP/zig/bin/pip" install --quiet "ziglang==$ZIG_VERSION"
           echo "$RUNNER_TEMP/zig/bin" >> "$GITHUB_PATH"
       - name: cargo-zigbuild
+        if: steps.bins.outputs.cache-hit != 'true'
         uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-zigbuild@${{ steps.pins.outputs.zigbuild }}
       - name: Restore the release dependency cache
+        if: steps.bins.outputs.cache-hit != 'true'
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: backend
           shared-key: farm-release-arm64
           cache-bin: "false"
       - name: Build api, worker and migrate once (static musl)
+        if: steps.bins.outputs.cache-hit != 'true'
         working-directory: backend
         run: |
           set -euo pipefail
