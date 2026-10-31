@@ -24,6 +24,12 @@ on:
         description: 'How long the driver runs (a k6 duration)'
         required: false
         default: '2m'
+      images:
+        description: 'staging: the digests staging pins at that commit; source: the images farm-build.yml built from source_ref (api:<sha>, worker:<sha>)'
+        required: false
+        type: choice
+        options: [staging, source]
+        default: staging
 
 permissions:
   contents: read
@@ -60,16 +66,24 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.PRIVATE_REPO_PAT }}
-      - name: The images staging runs, as the compose file's local tags
+      - name: The api and worker images, as the compose file's local tags
+        env:
+          IMAGES: ${{ inputs.images }}
+          REF: ${{ inputs.source_ref }}
         run: |
           set -euo pipefail
           pins="$(python3 -I scripts/lib/pins.py read infra/deploy/staging/release.yaml)"
           for t in api worker; do
-            d="$(python3 -I -c 'import json,sys; print(json.loads(sys.argv[1])[sys.argv[2] + "-digest"])' "$pins" "$t")"
-            printf '%s' "$d" | grep -Eq '^sha256:[0-9a-f]{64}$' || { echo "::error::no $t digest pinned"; exit 1; }
-            docker pull --quiet "$IMAGE_BASE/$t@$d" > /dev/null
-            docker tag "$IMAGE_BASE/$t@$d" "goodfood-$t:local"
-            echo "$t $d"
+            if [ "$IMAGES" = source ]; then
+              ref="$IMAGE_BASE/$t:$REF"
+            else
+              d="$(python3 -I -c 'import json,sys; print(json.loads(sys.argv[1])[sys.argv[2] + "-digest"])' "$pins" "$t")"
+              printf '%s' "$d" | grep -Eq '^sha256:[0-9a-f]{64}$' || { echo "::error::no $t digest pinned"; exit 1; }
+              ref="$IMAGE_BASE/$t@$d"
+            fi
+            docker pull --quiet "$ref" > /dev/null
+            docker tag "$ref" "goodfood-$t:local"
+            echo "$t $ref"
           done
       - name: k6 from the pinned image
         run: |
