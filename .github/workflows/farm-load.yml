@@ -1,0 +1,182 @@
+# Lane T8's k6 profiles (tests/load/smoke.js of the private Mom-s-Food/goodfood-main
+# repository) against staging, by hand: one profile per run, at a design point the
+# caller gives (B9 plan Task 8). Staging is the one free-tier node of ADR-0018, so the
+# design point is scaled from that node's measured breaking point and is never the
+# 250 requests a second of PERFORMANCE_GOALS: this workflow refuses 250 and more. The
+# results are interim (docs/plans/gates/b9/load.md) until production-shaped staging
+# exists (B9 owner decision 1).
+#
+# With the QA_SIGNIN_KEY repository secret (B9 owner decision 2: the staging-only
+# qa-replay key, which reads synthetic users' sign-in codes and nothing else) the run
+# signs synthetic users in and sends every hot path with lost-write accounting
+# (HOT_PATHS=true); without it, only the unauthenticated profile (GET /v1/config and
+# GET /ready) runs. The key reaches only the k6 step, through its environment, and is
+# never printed.
+#
+# Logs of a public repository are public. k6 prints the summary of smoke.js's
+# handleSummary (counts, rates and percentiles per metric), and the artifact holds that
+# summary as JSON and the report tests/load/load_test.go writes from it: no body, no
+# token, no code, no key.
+#
+# Runs are refused from 06:00 to 11:59 UTC: the nightly learning window (MEMORY_RUN_HOUR
+# 3 local for the synthetic users in America/New_York, 07:00 to 08:00 UTC) and the
+# daily food import (FOODS_IMPORT_HOUR_UTC 10). Do not start one while farm-probe or
+# farm-zap runs against staging; the concurrency group keeps load runs one at a time.
+name: farm-load
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Full commit SHA of Mom-s-Food/goodfood-main whose tests/load runs; empty uses main'
+        required: false
+        default: ''
+      profile:
+        description: 'k6 profile (tests/load/README.md)'
+        required: true
+        type: choice
+        options: [smoke, load, stress, spike]
+        default: smoke
+      design_point_rps:
+        description: 'Requests a second at 1x: scaled from the free node''s breaking point, 1 to 249'
+        required: true
+      skip_endpoints:
+        description: 'budgets.json endpoints left out of the hot-path mix, comma-separated (empty: none)'
+        required: false
+        default: ''
+      rtt_allowance_ms:
+        description: 'Milliseconds added to every budget for the round trip from the runner to us-sanjose-1'
+        required: false
+        default: '170'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: farm-load
+  cancel-in-progress: false
+
+env:
+  PRIVATE_REPO: Mom-s-Food/goodfood-main
+  STAGING_URL: https://api.64-181-241-30.sslip.io
+  K6_VERSION: v2.3.0
+
+jobs:
+  load:
+    name: k6 ${{ inputs.profile }} at ${{ inputs.design_point_rps }} rps against staging
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    steps:
+      - name: Validate the request
+        env:
+          REQUESTED: ${{ inputs.source_ref }}
+          RPS: ${{ inputs.design_point_rps }}
+          SKIP: ${{ inputs.skip_endpoints }}
+          RTT: ${{ inputs.rtt_allowance_ms }}
+        run: |
+          set -euo pipefail
+          if [ -n "$REQUESTED" ] && ! printf '%s' "$REQUESTED" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::source_ref must be a full lowercase commit SHA"; exit 1
+          fi
+          printf '%s' "$RPS" | grep -Eq '^[1-9][0-9]{0,2}$' || { echo "::error::design_point_rps must be a whole number from 1"; exit 1; }
+          if [ "$RPS" -ge 250 ]; then
+            echo "::error::staging is the free node (ADR-0018): scale the design point from its breaking point, never 250 (B9 decision 6)"; exit 1
+          fi
+          printf '%s' "$SKIP" | grep -Eq '^[a-z_,]{0,200}$' || { echo "::error::skip_endpoints: names and commas only"; exit 1; }
+          printf '%s' "$RTT" | grep -Eq '^[0-9]{1,4}$' || { echo "::error::rtt_allowance_ms must be a whole number"; exit 1; }
+          hour=$((10#$(date -u +%H)))
+          if [ "$hour" -ge 6 ] && [ "$hour" -lt 12 ]; then
+            echo "::error::06:00 to 11:59 UTC is the nightly learning and food import window on staging; start later"; exit 1
+          fi
+      - name: Check out the private source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ inputs.source_ref || 'main' }}
+          persist-credentials: false
+      - name: k6 (pinned, checksum verified)
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          base="https://github.com/grafana/k6/releases/download/${K6_VERSION}"
+          tgz="k6-${K6_VERSION}-linux-amd64.tar.gz"
+          curl -fsSL --retry 3 -o "$tgz" "$base/$tgz"
+          curl -fsSL --retry 3 -o k6.sums "$base/k6-${K6_VERSION}-checksums.txt"
+          grep " ${tgz}\$" k6.sums | sha256sum -c -
+          tar -xzf "$tgz"
+          mkdir -p bin && mv "k6-${K6_VERSION}-linux-amd64/k6" bin/k6
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/k6" version
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: tests/go.mod
+          cache: false
+      # The checks that need no server: the budget table against PERFORMANCE_GOALS, the
+      # write accounting and the stress arithmetic (farm-ci only compiles tests/).
+      - name: tests/load checks that need no server
+        run: go -C tests test -count=1 -run 'TestBudgetTable|TestWriteAccounting|TestStressAnalysis|TestSummaryShape' ./load/
+      - name: Staging is up and is staging
+        run: |
+          set -euo pipefail
+          env_name="$(curl -fsS --max-time 20 "$STAGING_URL/v1/config" | python3 -c 'import json,sys; print(json.load(sys.stdin)["environment"])')"
+          [ "$env_name" = staging ] || { echo "::error::$STAGING_URL reports environment $env_name"; exit 1; }
+      - name: k6 ${{ inputs.profile }}
+        id: k6
+        working-directory: tests/load
+        env:
+          QA_SIGNIN_KEY: ${{ secrets.QA_SIGNIN_KEY }}
+          PROFILE: ${{ inputs.profile }}
+          DESIGN_POINT_RPS: ${{ inputs.design_point_rps }}
+          SKIP_ENDPOINTS: ${{ inputs.skip_endpoints }}
+          RTT_ALLOWANCE_MS: ${{ inputs.rtt_allowance_ms }}
+          RUN_ID: farm${{ github.run_id }}
+        run: |
+          set +e -uo pipefail
+          out="$RUNNER_TEMP/load"; mkdir -p "$out"
+          if [ -n "$QA_SIGNIN_KEY" ]; then hot=true; else hot=false; unset QA_SIGNIN_KEY; fi
+          echo "hot paths: $hot"
+          BASE_URL="$STAGING_URL" HOT_PATHS="$hot" SIGNIN=qa SUMMARY_JSON="$out/summary.json" \
+            k6 run --quiet smoke.js
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          echo "k6 exited $rc (99: a threshold failed)"
+          exit 0
+      - name: Report (lost writes, breaking point, Retry-After, recovery)
+        id: report
+        if: ${{ !cancelled() }}
+        env:
+          PROFILE: ${{ inputs.profile }}
+          RPS: ${{ inputs.design_point_rps }}
+          K6_RC: ${{ steps.k6.outputs.rc }}
+        run: |
+          set +e -uo pipefail
+          out="$RUNNER_TEMP/load"
+          [ -s "$out/summary.json" ] || { echo "::error::k6 wrote no summary"; echo "rc=1" >> "$GITHUB_OUTPUT"; exit 0; }
+          LOAD_SUMMARY="$out/summary.json" LOAD_REPORT="$out/report.md" \
+            go -C tests test -count=1 -run '^TestLoadSummary$' ./load/
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          {
+            echo "### farm-load: $PROFILE at $RPS rps"
+            echo
+            echo "Source \`$(git rev-parse HEAD)\`, $(date -u +%Y-%m-%dT%H:%MZ), k6 exit $K6_RC, report exit $rc."
+            echo
+            cat "$out/report.md" 2>/dev/null
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+      - name: Upload the summary and report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: farm-load-${{ inputs.profile }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/load
+          retention-days: 30
+      - name: Fail when k6 or the report failed
+        if: ${{ !cancelled() }}
+        env:
+          K6_RC: ${{ steps.k6.outputs.rc }}
+          REPORT_RC: ${{ steps.report.outputs.rc }}
+        run: |
+          echo "k6 exit $K6_RC, report exit $REPORT_RC"
+          [ "$K6_RC" = 0 ] && [ "$REPORT_RC" = 0 ]
