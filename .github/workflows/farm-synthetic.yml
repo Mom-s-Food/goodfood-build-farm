@@ -105,3 +105,10 @@ jobs:
       - name: Stack status
         if: ${{ always() }}
         run: docker compose -f infra/compose/dev.yml ps --format '{{.Service}} {{.State}} {{.Status}}' || true
+      # Warnings and errors only, and never a line that mentions a code or a token (the local
+      # stack's are throwaway, and still not printed).
+      - name: Warnings and errors of the api and worker
+        if: ${{ failure() }}
+        run: |
+          docker compose -f infra/compose/dev.yml logs --no-color --no-log-prefix api worker 2>/dev/null \
+            | grep -Ei '"level":"(warn|error)"' | grep -Eiv 'code|token|secret|key' | cut -c1-400 | tail -60 || true
