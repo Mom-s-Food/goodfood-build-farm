@@ -107,6 +107,11 @@ jobs:
             sed 's/\t/ | /g; s/^/| /; s/$/ |/' "$out/tests.tsv"
           } >> "$GITHUB_STEP_SUMMARY"
           cat "$out/run.txt" "$out/tests.tsv"
+          # A -run pattern that matches nothing makes go test exit 0 having run nothing.
+          if [ $((pass + skip + fail)) -eq 0 ] && [ "$code" -eq 0 ]; then
+            echo "::error::no journey ran (run pattern '${RUN:-<all>}' matched no test)"
+            code=1; echo "code=$code" >> "$GITHUB_OUTPUT"
+          fi
           if [ "$fail" -gt 0 ] || [ "$code" -ne 0 ]; then
             echo "::group::Output of the failed tests"
             awk -F'\t' '$1 == "fail" {print $2}' "$out/tests.tsv" | while IFS= read -r t; do
