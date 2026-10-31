@@ -512,6 +512,13 @@ jobs:
           go vet ./...
           go build ./...
           go test -count=1 -run '^$' ./...
+      # The compatibility-replay harness and every committed archive against a mirror (no
+      # backend; farm-replay.yml replays them against the local stack). Skipped on commits
+      # from before the harness existed (B9 Task 23).
+      - name: Compatibility-replay harness (T3, tests/contract/replay)
+        if: ${{ !cancelled() && hashFiles('tests/contract/replay/*.go') != '' }}
+        working-directory: tests
+        run: go test -count=1 ./contract/replay/...
 
       # infra
       - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
