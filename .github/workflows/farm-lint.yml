@@ -1,0 +1,53 @@
+# Checks the farm's own workflows on every push to this repository: actionlint (expressions,
+# contexts, job graph; a workflow that does not load fails here, not on an agent's dispatch) and
+# scripts/check-farm-workflows.py, which keeps every workflow within the job budget of
+# .github/farm-capacity.json (capped matrices, background workflows one run at a time, schedules
+# spread, room left for farm-ci). Runs only this repository's files: no secret, no private source.
+name: farm-lint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/**'
+      - 'scripts/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: farm-lint-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ACTIONLINT_VERSION: 1.7.12
+  PYYAML_VERSION: 6.0.3
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: actionlint
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          base="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}"
+          curl -fsSL --retry 3 -o actionlint.tgz "$base/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 3 -o actionlint.sums "$base/actionlint_${ACTIONLINT_VERSION}_checksums.txt"
+          grep " actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz\$" actionlint.sums | sed 's/ .*/  actionlint.tgz/' | sha256sum -c -
+          tar -xzf actionlint.tgz actionlint
+          cd "$GITHUB_WORKSPACE"
+          # The shell inside run: blocks is checked where it is written; here the workflow itself.
+          "$RUNNER_TEMP/actionlint" -color -shellcheck= -pyflakes=
+      - name: Job budget (.github/farm-capacity.json)
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet "pyyaml==$PYYAML_VERSION"
+          "$RUNNER_TEMP/venv/bin/python" -I scripts/check-farm-workflows.py . | tee -a "$GITHUB_STEP_SUMMARY"

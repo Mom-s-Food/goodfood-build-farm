@@ -15,9 +15,37 @@ and works on one pinned commit.
 | `farm-zap.yml` | Nightly (02:40 UTC) on `main`, or by hand with a commit SHA | Lane T9: `scripts/test/security-scan.sh --dast --env staging`, the OWASP ZAP API scan of staging from the contract (ZAP pinned by digest in that script), signed in as a fresh synthetic user that is deleted afterwards. The log shows only alert counts per level (`--public-log`: no alert names, plugin ids, URLs or ZAP output), and the `zap-report-<run>` artifact holds only `zap-reports.tar.gz.age`, the JSON and HTML reports and ZAP's output encrypted with `age` to the owner's public key in the `ZAP_REPORT_AGE_RECIPIENT` repository variable (none kept until it exists); a High-risk alert fails the run unless `tests/security/zap/rules.tsv` says otherwise. Needs the `QA_SIGNIN_KEY` secret (B9 decision 2); until it exists the run warns and scans nothing. Never scans production. |
 | `farm-synthetic.yml` | By hand with a commit SHA | B9 Tasks 1 and 2: starts the local stack (Docker Compose) from the api and worker images staging pins at that commit, seeds three synthetic users through the public API (`tests/synthetic`), seeds them again (all skipped), then runs `tests/synthetic/driver.js` in smoke mode for `driver_duration` (default 2 minutes) with the k6 of the image staging pins. Uses no key: the local stack serves its own sign-in codes. |
 | `farm-probe.yml` | Every 5 minutes, or by hand with a commit SHA | B9 Task 5, the external probe: `scripts/validation/probe.sh --env staging` from the private `main` signs a synthetic user in, logs a typed meal, reads Today and deletes the meal, each step within its budget plus 170 ms. Each run keeps `probe-<run>` (statuses and timings only) for 30 days; two failed probes in a row fail the run, so GitHub mails the owner. Needs the `QA_SIGNIN_KEY` secret (B9 decision 2); until it exists, or until `probe.sh` is on `main`, each run records `skipped` and passes. |
+| `farm-lint.yml` | Every push to this repository's `main` that changes `.github/` or `scripts/`, or by hand | actionlint over the farm's workflows and `scripts/check-farm-workflows.py` (the job budget above). Reads only this repository. |
 
 The private repository sends both dispatches on every push to `main`
 (`.github/workflows/farm-dispatch.yml` there).
+
+## Job budget
+
+The org is on GitHub Free: about **20 concurrent jobs for the whole org**, shared by every
+workflow here. `.github/farm-capacity.json` is the budget and `farm-lint.yml` enforces it on every
+push (`scripts/check-farm-workflows.py`, plus actionlint):
+
+- every matrix has a `max-parallel` of at most 4 (farm-fuzz: 2 builds, 4 targets at once);
+- every background workflow (fuzz, perf, replay per mode, synthetic, load, evals, zap,
+  staging-nightly, probe) runs **one at a time** through a fixed concurrency group with
+  `cancel-in-progress: false`: a newer dispatch replaces the queued one, a running one is never
+  cancelled. Their peaks add up to 13 jobs, so farm-ci (6 jobs at once after setup) always has 7;
+- daily schedules are at least an hour apart (UTC): zap 02:40, perf 06:17 (Mondays),
+  staging-nightly 07:17, replay 19:50, fuzz 22:23; the probe runs every 5 minutes (1 job);
+- farm-build's `deploy-staging` never waits on a runner: while `farm/ci` is pending it posts
+  `farm/deploy` = pending ("waiting for farm/ci") and ends, and farm-ci's report re-runs that job
+  once `farm/ci` passes. `farm/deploy` on the private commit shows where the deploy stands.
+
+For agents that dispatch farm runs:
+
+- Dispatch with the output of `git rev-parse <branch>`, never a typed SHA; farm-ci now fails at
+  once on a SHA that does not exist.
+- Dispatch farm-ci once per pushed SHA and **do not cancel a queued run**: it holds no job slot,
+  and cancelling it only loses its place. Cancel only a run superseded by a newer commit on the
+  same branch. A cancelled run posts `farm/ci` = error ("cancelled; re-dispatch farm-ci") while
+  the status still points at it, so a commit never stays pending.
+- During the day, run farm-fuzz with `targets` for a subset rather than every target.
 
 ## Secrets
 
@@ -32,7 +60,7 @@ The private repository sends both dispatches on every push to `main`
 
 - Logs are public. Nothing prints a secret, and all test data is synthetic. A compiler error
   quotes the failing source lines; the owner accepted that on 2026-11-03.
-- Only `repository_dispatch`, `workflow_dispatch`, `farm-perf`'s weekly schedule (which
+- Only `repository_dispatch`, `workflow_dispatch`, `farm-lint`'s push trigger (this repository's own files, no secret), `farm-perf`'s weekly schedule (which
   measures `main`) `farm-zap`'s nightly schedule (which scans staging from `main`) and `farm-probe`'s 5-minute schedule (which probes staging with `main`'s `probe.sh`) start a run. Pull requests from forks
   never do, so outside code never runs with the token.
 - Deploying to OCI is a later step that needs the owner's approval.
