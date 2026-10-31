@@ -19,6 +19,6 @@
     "farm-evals": {"group": "farm-evals"},
     "farm-zap": {"group": "farm-zap"},
     "farm-staging-nightly": {"group": "farm-staging-nightly"},
-    "farm-probe": {"group": "farm-probe"}
+    "farm-probe": {"group": "farm-probe", "_doc": "holds its 1 job all the time: a chain of ~5 h 40 min runs, each dispatching the next"}
   }
 }
