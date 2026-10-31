@@ -605,6 +605,10 @@ jobs:
     if: ${{ always() && needs.setup.outputs.source_ref != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: read
+      # Re-run farm-build's deploy-staging job that is waiting for this farm/ci.
+      actions: write
     steps:
       # cancelled() works only in an if: condition, so a step records it for the report.
       - name: Was the run cancelled
@@ -612,6 +616,7 @@ jobs:
         if: ${{ cancelled() }}
         run: echo "cancelled=true" >> "$GITHUB_OUTPUT"
       - name: Report the result to the private commit
+        id: report
         if: ${{ always() }}
         env:
           GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
@@ -647,3 +652,36 @@ jobs:
             echo "### $STATUS_CONTEXT: $state"
             echo "$desc"
           } >> "$GITHUB_STEP_SUMMARY"
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+      # farm-build's deploy-staging gate does not wait on a runner: when farm/ci was still pending
+      # it left farm/deploy=pending ('waiting for farm/ci') pointing at its run. Hand it back now.
+      - name: Hand a waiting staging deploy back to farm-build
+        if: ${{ always() && steps.report.outputs.state != '' }}
+        env:
+          PAT: ${{ secrets.PRIVATE_REPO_PAT }}
+          FARM_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.setup.outputs.source_ref }}
+          STATE: ${{ steps.report.outputs.state }}
+        run: |
+          set -euo pipefail
+          waiting="$(GH_TOKEN=$PAT gh api "repos/$PRIVATE_REPO/commits/$SHA/status" \
+            --jq '[.statuses[] | select(.context == "farm/deploy")][0] | select(.state == "pending" and (.description | startswith("waiting for farm/ci"))) | .target_url')"
+          [ -n "$waiting" ] || { echo "no staging deploy waits for this commit"; exit 0; }
+          # A cancelled run (error) leaves the deploy waiting for the farm-ci run that replaces it.
+          [ "$STATE" != error ] || { echo "farm/ci is error (cancelled): the deploy keeps waiting"; exit 0; }
+          run_id="${waiting##*/runs/}"; run_id="${run_id%%[!0-9]*}"
+          if [ "$STATE" != success ]; then
+            GH_TOKEN=$PAT gh api "repos/$PRIVATE_REPO/statuses/$SHA" -X POST -f context=farm/deploy \
+              -f target_url="$waiting" -f state=error -f description="not deployed: farm/ci is $STATE" > /dev/null
+            echo "farm/ci is $STATE: the waiting deploy of run $run_id is not re-run"; exit 0
+          fi
+          for i in 1 2 3 4 5 6; do
+            job="$(GH_TOKEN=$FARM_TOKEN gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs" \
+              --jq '.jobs[] | select(.name == "deploy-staging") | .id' | head -1)"
+            if [ -n "$job" ] && { GH_TOKEN=$FARM_TOKEN gh run rerun "$run_id" --job "$job" -R "$GITHUB_REPOSITORY" \
+                 || GH_TOKEN=$PAT gh run rerun "$run_id" --job "$job" -R "$GITHUB_REPOSITORY"; }; then
+              echo "re-ran deploy-staging of farm-build run $run_id"; exit 0
+            fi
+            sleep $((i * 10))  # the run may still be finishing
+          done
+          echo "::warning::could not re-run deploy-staging of farm-build run $run_id; re-run it by hand"
