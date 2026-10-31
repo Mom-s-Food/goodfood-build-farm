@@ -1,0 +1,107 @@
+# Verifies the B9 synthetic cohort tooling of one private goodfood-main commit on
+# the local stack (Docker Compose), as tests/synthetic/seed_test.go expects: it
+# seeds three synthetic users through the public API (scripts/dev/seed-synthetic.sh's
+# Go package), seeds them again (every user skipped), then runs
+# tests/synthetic/driver.js in smoke mode for two minutes with the k6 binary of
+# the image staging pins (infra/deploy/staging/synthetic/deployment.yaml).
+#
+# The stack runs the api and worker images staging runs (the digests pinned in
+# infra/deploy/staging/release.yaml of that commit), with the compose file's
+# local settings (ENV=local, AI_MODE=simulated, codes from /local/signin-code), so
+# nothing is built here and no key is used: the local stack needs none.
+#
+# Logs are public: the steps print counts and statuses, never a sign-in code or a
+# token (the local stack's are throwaway, and still not printed).
+name: farm-synthetic
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Full commit SHA of Mom-s-Food/goodfood-main'
+        required: true
+      driver_duration:
+        description: 'How long the driver runs (a k6 duration)'
+        required: false
+        default: '2m'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: farm-synthetic-${{ inputs.source_ref }}
+  cancel-in-progress: true
+
+env:
+  PRIVATE_REPO: Mom-s-Food/goodfood-main
+  IMAGE_BASE: ghcr.io/mom-s-food/goodfood-main
+
+jobs:
+  local-stack:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - name: Validate the request
+        env:
+          REF: ${{ inputs.source_ref }}
+          DUR: ${{ inputs.driver_duration }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::source_ref must be a full lowercase commit SHA"; exit 1; }
+          printf '%s' "$DUR" | grep -Eq '^[0-9]{1,2}m$' || { echo "::error::driver_duration must be minutes, such as 2m"; exit 1; }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.PRIVATE_REPO_PAT }}
+      - name: The images staging runs, as the compose file's local tags
+        run: |
+          set -euo pipefail
+          pins="$(python3 -I scripts/lib/pins.py read infra/deploy/staging/release.yaml)"
+          for t in api worker; do
+            d="$(python3 -I -c 'import json,sys; print(json.loads(sys.argv[1])[sys.argv[2] + "-digest"])' "$pins" "$t")"
+            printf '%s' "$d" | grep -Eq '^sha256:[0-9a-f]{64}$' || { echo "::error::no $t digest pinned"; exit 1; }
+            docker pull --quiet "$IMAGE_BASE/$t@$d" > /dev/null
+            docker tag "$IMAGE_BASE/$t@$d" "goodfood-$t:local"
+            echo "$t $d"
+          done
+      - name: k6 from the pinned image
+        run: |
+          set -euo pipefail
+          img="$(sed -nE 's/^[[:space:]]*image:[[:space:]]*(grafana\/k6[^ ]*@sha256:[0-9a-f]{64}).*/\1/p' infra/deploy/staging/synthetic/deployment.yaml)"
+          [ -n "$img" ] || { echo "::error::no pinned grafana/k6 image in the synthetic deployment"; exit 1; }
+          docker pull --quiet "$img" > /dev/null
+          id="$(docker create "$img")"
+          docker cp "$id:/usr/bin/k6" "$RUNNER_TEMP/k6"
+          docker rm "$id" > /dev/null
+          sudo install -m 0755 "$RUNNER_TEMP/k6" /usr/local/bin/k6
+          k6 version
+      - name: Start the local stack
+        run: |
+          set -euo pipefail
+          docker compose -f infra/compose/dev.yml up -d --no-build --quiet-pull
+          for _ in $(seq 1 90); do
+            if curl -fsS -o /dev/null --max-time 2 http://localhost:8080/ready; then echo "ready"; exit 0; fi
+            sleep 2
+          done
+          docker compose -f infra/compose/dev.yml ps
+          echo "::error::the api did not become ready"; exit 1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: tests/go.mod
+          cache: false
+      - name: Seed, seed again, and drive (tests/synthetic)
+        working-directory: tests
+        env:
+          SYNTHETIC_BASE_URL: http://localhost:8080
+          DRIVER_TEST_DURATION: ${{ inputs.driver_duration }}
+        run: go test ./synthetic/ -count=1 -v -timeout 30m
+      - name: Stack status
+        if: ${{ always() }}
+        run: docker compose -f infra/compose/dev.yml ps --format '{{.Service}} {{.State}} {{.Status}}' || true
