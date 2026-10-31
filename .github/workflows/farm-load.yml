@@ -45,9 +45,9 @@ on:
         required: false
         default: ''
       rtt_allowance_ms:
-        description: 'Milliseconds added to every budget for the round trip from the runner to us-sanjose-1'
+        description: 'Milliseconds added to every budget for the round trip from the runner (0: the 2026-10-31 runner saw /v1/config p95 at 18 ms in all)'
         required: false
-        default: '170'
+        default: '0'
 
 permissions:
   contents: read
