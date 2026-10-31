@@ -91,6 +91,10 @@ jobs:
       - name: k6 from the pinned image
         run: |
           set -euo pipefail
+          if [ ! -f infra/deploy/staging/synthetic/deployment.yaml ]; then
+            echo "::error::this commit has no infra/deploy/staging/synthetic/deployment.yaml (B9 Tasks 1 and 2); dispatch a commit that has the synthetic cohort"
+            exit 1
+          fi
           img="$(sed -nE 's/^[[:space:]]*image:[[:space:]]*(grafana\/k6[^ ]*@sha256:[0-9a-f]{64}).*/\1/p' infra/deploy/staging/synthetic/deployment.yaml)"
           [ -n "$img" ] || { echo "::error::no pinned grafana/k6 image in the synthetic deployment"; exit 1; }
           docker pull --quiet "$img" > /dev/null
