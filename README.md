@@ -12,6 +12,7 @@ and works on one pinned commit.
 | `farm-build.yml` | `repository_dispatch: trigger-build`, or by hand | Builds the `api` and `worker` images (arm64, for the OCI Ampere nodes) and pushes them to `ghcr.io/mom-s-food/goodfood-main/{api,worker}:<sha>`; uploads a release receipt with each digest. It never deploys. |
 | `farm-evals.yml` | By hand: `branch`, `mode` (`live` or `record`), `suite`, case and cost caps | Runs the evals command with the development key. `record` writes each answer to `backend/testdata/recordings/` and pushes one commit to the branch (never `main`). |
 | `farm-task.yml` | By hand: `branch` (never `main`), `task`, optional `suite` | One file-writing cargo task, pushed to the branch as one commit: `gen-cases` (the eval case generator; commits `evals/`), `write-recordings` (the synthetic recordings of the held-out split on the default grid, no key and no model call; commits `backend/testdata/recordings/` and `evals/`) or `fmt` (`cargo fmt --all`; commits `backend/`). A task that changes anything outside its paths fails and pushes nothing. |
+| `farm-zap.yml` | Nightly (02:40 UTC) on `main`, or by hand with a commit SHA | Lane T9: `scripts/test/security-scan.sh --dast --env staging`, the OWASP ZAP API scan of staging from the contract (ZAP pinned by digest in that script), signed in as a fresh synthetic user that is deleted afterwards. Uploads the `zap-report-<run>` artifact (JSON and HTML; no request headers); a High-risk alert fails the run unless `tests/security/zap/rules.tsv` says otherwise. Needs the `QA_SIGNIN_KEY` secret (B9 decision 2); until it exists the run warns and scans nothing. Never scans production. |
 
 The private repository sends both dispatches on every push to `main`
 (`.github/workflows/farm-dispatch.yml` there).
@@ -27,7 +28,7 @@ The private repository sends both dispatches on every push to `main`
 
 - Logs are public. Nothing prints a secret, and all test data is synthetic. A compiler error
   quotes the failing source lines; the owner accepted that on 2026-11-03.
-- Only `repository_dispatch`, `workflow_dispatch` and `farm-perf`'s weekly schedule (which
-  measures `main`) start a run. Pull requests from forks
+- Only `repository_dispatch`, `workflow_dispatch`, `farm-perf`'s weekly schedule (which
+  measures `main`) and `farm-zap`'s nightly schedule (which scans staging from `main`) start a run. Pull requests from forks
   never do, so outside code never runs with the token.
 - Deploying to OCI is a later step that needs the owner's approval.
