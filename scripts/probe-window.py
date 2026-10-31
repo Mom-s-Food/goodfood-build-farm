@@ -8,6 +8,7 @@ Every farm-probe run keeps probe-<run id> with results.jsonl: one line per probe
 - the probes counted (ok true or false; skipped ones are not probes), passed and failed;
 - every gap of more than --max-gap minutes (default 15) between counted probes, and
   between the window's edges and the first or last probe: each is a miss;
+- the window ends now, or where the farm-probe run still going started (its probes are not uploaded yet);
 - the verdict: GREEN when the window holds counted probes from its start to its end,
   no miss and no two failed probes in a row; else NOT GREEN with the reasons.
 
@@ -33,13 +34,19 @@ def parse_at(s):
 
 
 def load(repo, since):
-    probes, page = [], 1
+    """The probes of every farm-probe run created since `since`, and the start of the earliest run still
+    going (its probes are uploaded only when it ends), or None."""
+    probes, page, live = [], 1, None
     while True:
         runs = gh("api", f"repos/{repo}/actions/workflows/farm-probe.yml/runs?per_page=100&page={page}"
                   f"&created=>={since:%Y-%m-%dT%H:%M:%SZ}")["workflow_runs"]
         if not runs:
             break
         for r in runs:
+            if r["status"] == "in_progress":
+                started = parse_at(r.get("run_started_at") or r["created_at"])
+                live = started if live is None else min(live, started)
+                continue
             arts = gh("api", f"repos/{repo}/actions/runs/{r['id']}/artifacts")["artifacts"]
             for a in arts:
                 if a["name"] != f"probe-{r['id']}" or a["expired"]:
@@ -55,7 +62,7 @@ def load(repo, since):
                             one.setdefault("at", r["created_at"])
                             probes.append(one)
         page += 1
-    return probes
+    return probes, live
 
 
 def main():
@@ -65,9 +72,12 @@ def main():
     ap.add_argument("--repo", default="Mom-s-Food/goodfood-build-farm")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args()
-    end = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    # A run starts up to ~6 h before its last probe; a run still going has uploaded nothing yet, so the
+    # window ends where it started.
+    probes, live = load(a.repo, now - dt.timedelta(days=a.days, hours=7))
+    end = min(now, live) if live else now
     start = end - dt.timedelta(days=a.days)
-    probes = load(a.repo, start - dt.timedelta(hours=7))  # a run starts up to ~6 h before its last probe
     counted = sorted((p for p in probes if p.get("ok") in (True, False) and "at" in p
                       and start <= parse_at(p["at"]) <= end), key=lambda p: p["at"])
     gap = dt.timedelta(minutes=a.max_gap)
