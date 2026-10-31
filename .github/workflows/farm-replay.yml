@@ -35,15 +35,19 @@ on:
         required: false
         default: synthetic-0.0.0
   schedule:
-    # Nightly on main, after the nightly builds and before the working day.
-    - cron: '20 4 * * *'
+    # Nightly on main, 19:50 UTC: clear of farm-fuzz (22:23), farm-zap (02:40), farm-perf
+    # (Mondays 06:17) and farm-staging-nightly (07:17). See .github/farm-capacity.json.
+    - cron: '50 19 * * *'
 
 permissions:
   contents: read
 
 concurrency:
-  group: farm-replay-${{ inputs.source_ref || 'main' }}-${{ inputs.mode || 'replay' }}
-  cancel-in-progress: true
+  # One replay (per mode) run at a time on the whole farm (a newer dispatch replaces the queued one, a
+  # running one is never cancelled): the free plan has 20 concurrent jobs and farm-ci needs most of
+  # them. .github/farm-capacity.json budgets every workflow; scripts/check-farm-workflows.py checks it.
+  group: farm-replay-${{ inputs.mode || 'replay' }}
+  cancel-in-progress: false
 
 env:
   PRIVATE_REPO: Mom-s-Food/goodfood-main

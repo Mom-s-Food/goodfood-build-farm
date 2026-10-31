@@ -29,8 +29,11 @@ permissions:
   contents: read
 
 concurrency:
-  group: farm-perf-${{ inputs.source_ref || 'main' }}
-  cancel-in-progress: true
+  # One perf run at a time on the whole farm (a newer dispatch replaces the queued one, a
+  # running one is never cancelled): the free plan has 20 concurrent jobs and farm-ci needs most of
+  # them. .github/farm-capacity.json budgets every workflow; scripts/check-farm-workflows.py checks it.
+  group: farm-perf
+  cancel-in-progress: false
 
 env:
   PRIVATE_REPO: Mom-s-Food/goodfood-main
@@ -186,15 +189,33 @@ jobs:
           name: t8-timing-report
           path: ${{ runner.temp }}/t8-report
           retention-days: 30
+      # cancelled() works only in an if: condition, so a step records it for the report.
+      - name: Was the run cancelled
+        id: cancel
+        if: ${{ cancelled() }}
+        run: echo "cancelled=true" >> "$GITHUB_OUTPUT"
+      # Also on a cancelled run, so farm/perf never stays pending: error, but only while the
+      # commit's farm/perf still points at this run.
       - name: Report the result to the private commit
-        if: ${{ !cancelled() && steps.pin.outputs.sha != '' }}
+        if: ${{ always() && steps.pin.outputs.sha != '' }}
         env:
           GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
           SHA: ${{ steps.pin.outputs.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           OUTCOME: ${{ steps.run.outcome }}
+          CANCELLED: ${{ steps.cancel.outputs.cancelled == 'true' }}
         run: |
           set -euo pipefail
+          if [ "$CANCELLED" = true ]; then
+            current="$(gh api "repos/$PRIVATE_REPO/commits/$SHA/status" \
+              --jq '[.statuses[] | select(.context == "farm/perf")][0].target_url // ""')"
+            if [ "$current" != "$RUN_URL" ]; then
+              echo "run cancelled; $STATUS_CONTEXT points at ${current:-nothing} and is left as it is"; exit 0
+            fi
+            gh api "repos/$PRIVATE_REPO/statuses/$SHA" -X POST -f state=error -f context="$STATUS_CONTEXT" \
+              -f target_url="$RUN_URL" -f description="cancelled; re-dispatch farm-perf" > /dev/null
+            echo "$STATUS_CONTEXT: error (cancelled)"; exit 0
+          fi
           over=0; failed=0
           if [ -f "$RUNNER_TEMP/t8-results.tsv" ]; then
             failed=$(awk -F'\t' '$4 != "passed"' "$RUNNER_TEMP/t8-results.tsv" | wc -l)

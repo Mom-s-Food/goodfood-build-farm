@@ -35,8 +35,11 @@ permissions:
   contents: read
 
 concurrency:
-  group: farm-synthetic-${{ inputs.source_ref }}
-  cancel-in-progress: true
+  # One synthetic run at a time on the whole farm (a newer dispatch replaces the queued one, a
+  # running one is never cancelled): the free plan has 20 concurrent jobs and farm-ci needs most of
+  # them. .github/farm-capacity.json budgets every workflow; scripts/check-farm-workflows.py checks it.
+  group: farm-synthetic
+  cancel-in-progress: false
 
 env:
   PRIVATE_REPO: Mom-s-Food/goodfood-main
