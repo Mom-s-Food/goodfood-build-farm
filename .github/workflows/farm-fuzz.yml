@@ -142,7 +142,9 @@ jobs:
           # The backend's lock file as the starting point, so the fuzz build uses the same
           # dependency versions as farm-ci (cargo adds only libfuzzer-sys and the like).
           cp ../../../Cargo.lock Cargo.lock
-          cargo "+$NIGHTLY" fuzz build -O --debug-assertions
+          # The prebuilt cargo-fuzz is a musl binary and would default to its own target;
+          # AddressSanitizer needs the glibc one.
+          cargo "+$NIGHTLY" fuzz build -O --debug-assertions --target x86_64-unknown-linux-gnu
           out="$RUNNER_TEMP/bins"; mkdir -p "$out"
           for b in $(python3 -I -c 'import tomllib; print(" ".join(b["name"] for b in tomllib.load(open("Cargo.toml","rb"))["bin"]))'); do
             cp "target/x86_64-unknown-linux-gnu/release/$b" "$out/"
