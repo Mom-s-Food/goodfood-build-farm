@@ -1,0 +1,131 @@
+# Runs the T4 API journeys of the private Mom-s-Food/goodfood-main repository against staging
+# (https://api.64-181-241-30.sslip.io, deployed by Flux from main) every night, and by hand
+# (TESTING_STRATEGY §1, lane T4 "nightly against staging"; B9 plan Task 26, gate item G29).
+#
+# The journeys sign up synthetic users of the qa-replay cohort only (qa+<id>@synthetic.goodfood.test)
+# and read their sign-in codes from GET /qa/signin-code with the staging QA_SIGNIN_KEY. That key is
+# a farm repository secret only once the owner approves the copy (B9 plan, owner decision 2;
+# docs/operations/SECRETS.md "Adding a new credential"). Until then the run goes ahead without it:
+# the journeys that sign in skip, the rest (smoke) run, and the summary says so.
+#
+# Logs of a public repository are public. The key reaches only the test step, through its
+# environment, and is never printed (GitHub also masks it); the journeys print no key, code or
+# token. Every user and record is synthetic. The go test -json results are kept as an artifact
+# (for `req-coverage.py --results`).
+name: farm-staging-nightly
+
+on:
+  schedule:
+    # 07:17 UTC: night in the Americas and Europe, away from the top of the hour.
+    - cron: '17 7 * * *'
+  workflow_dispatch:
+    inputs:
+      run:
+        description: 'Optional go test -run pattern (for example TestTimeZone); empty runs every journey'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+# One staging run at a time; a queued run waits, never cancels a running one.
+concurrency:
+  group: farm-staging-nightly
+  cancel-in-progress: false
+
+env:
+  PRIVATE_REPO: Mom-s-Food/goodfood-main
+  BASE_URL: https://api.64-181-241-30.sslip.io
+
+jobs:
+  journeys:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Validate the request
+        env:
+          RUN: ${{ inputs.run }}
+        run: |
+          set -euo pipefail
+          [ -z "$RUN" ] || printf '%s' "$RUN" | grep -Eq '^[A-Za-z0-9_|^$/.-]{1,120}$' || { echo "::error::run must be a go test -run pattern"; exit 1; }
+      - name: Check out the private source (main, what staging runs)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: tests/go.mod
+          cache: false
+      - name: Staging answers
+        run: |
+          set -euo pipefail
+          for i in 1 2 3 4 5 6; do
+            if curl -fsS --max-time 10 "$BASE_URL/ready" > /dev/null; then echo "staging is ready"; exit 0; fi
+            echo "not ready yet ($i)"; sleep 10
+          done
+          echo "::error::$BASE_URL/ready did not answer 200 within a minute"; exit 1
+      - name: T4 journeys against staging
+        id: t4
+        working-directory: tests
+        env:
+          # The key exists only in this step's environment; nothing prints it.
+          QA_SIGNIN_KEY: ${{ secrets.QA_SIGNIN_KEY }}
+          RUN: ${{ inputs.run }}
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/t4"; mkdir -p "$out"
+          if [ -z "$QA_SIGNIN_KEY" ]; then
+            echo "::warning::QA_SIGNIN_KEY is not a secret of this repository yet (owner decision 2): journeys that sign in skip"
+            key=absent
+          else
+            key=present
+          fi
+          args=(-count=1 -json -timeout 30m)
+          [ -z "$RUN" ] || args+=(-run "$RUN")
+          go test "${args[@]}" ./api-e2e/... > "$out/results.json"
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          src="$(git rev-parse HEAD)"
+          printf 'source %s\nbase %s\nqa key %s\nexit %s\n' "$src" "$BASE_URL" "$key" "$code" > "$out/run.txt"
+          # One line per top-level test and subtest: its result and time.
+          jq -r 'select(.Test != null and (.Action == "pass" or .Action == "fail" or .Action == "skip"))
+                 | "\(.Action)\t\(.Test)\t\(.Elapsed // 0)s"' "$out/results.json" > "$out/tests.tsv" || true
+          pass=$(grep -c '^pass' "$out/tests.tsv" || true)
+          skip=$(grep -c '^skip' "$out/tests.tsv" || true)
+          fail=$(grep -c '^fail' "$out/tests.tsv" || true)
+          {
+            echo "### farm-staging-nightly: T4 on staging, exit $code"
+            echo
+            echo "Source \`main\` at \`${src:0:12}\`, $BASE_URL, QA_SIGNIN_KEY $key."
+            echo "Passed $pass, skipped $skip, failed $fail (tests and subtests)."
+            echo
+            echo '| Result | Test | Time |'
+            echo '| --- | --- | --- |'
+            sed 's/\t/ | /g; s/^/| /; s/$/ |/' "$out/tests.tsv"
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$out/run.txt" "$out/tests.tsv"
+          if [ "$fail" -gt 0 ] || [ "$code" -ne 0 ]; then
+            echo "::group::Output of the failed tests"
+            awk -F'\t' '$1 == "fail" {print $2}' "$out/tests.tsv" | while IFS= read -r t; do
+              jq -r --arg t "$t" 'select(.Test == $t and .Action == "output") | .Output' "$out/results.json"
+            done
+            echo "::endgroup::"
+          fi
+      - name: Keep the results
+        if: ${{ always() && steps.t4.outcome != 'skipped' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: t4-staging-${{ github.run_id }}
+          path: ${{ runner.temp }}/t4/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Fail when a journey failed
+        if: ${{ steps.t4.outputs.code != '0' }}
+        env:
+          CODE: ${{ steps.t4.outputs.code }}
+        run: |
+          echo "::error::go test exited $CODE; see the failed tests' output above and the results artifact"
+          exit 1
