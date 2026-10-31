@@ -82,7 +82,7 @@ jobs:
           if [ "$RPS" -ge 250 ]; then
             echo "::error::staging is the free node (ADR-0018): scale the design point from its breaking point, never 250 (B9 decision 6)"; exit 1
           fi
-          printf '%s' "$SKIP" | grep -Eq '^[a-z_,]{0,200}$' || { echo "::error::skip_endpoints: names and commas only"; exit 1; }
+          [ -z "$SKIP" ] || printf '%s' "$SKIP" | grep -Eq '^[a-z_,]{1,200}$' || { echo "::error::skip_endpoints: names and commas only"; exit 1; }
           printf '%s' "$RTT" | grep -Eq '^[0-9]{1,4}$' || { echo "::error::rtt_allowance_ms must be a whole number"; exit 1; }
           hour=$((10#$(date -u +%H)))
           if [ "$hour" -ge 6 ] && [ "$hour" -lt 12 ]; then
@@ -144,7 +144,7 @@ jobs:
           exit 0
       - name: Report (lost writes, breaking point, Retry-After, recovery)
         id: report
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.k6.outcome == 'success' }}
         env:
           PROFILE: ${{ inputs.profile }}
           RPS: ${{ inputs.design_point_rps }}
@@ -166,14 +166,14 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit 0
       - name: Upload the summary and report
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.k6.outcome == 'success' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: farm-load-${{ inputs.profile }}-${{ github.run_id }}
           path: ${{ runner.temp }}/load
           retention-days: 30
       - name: Fail when k6 or the report failed
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.k6.outcome == 'success' }}
         env:
           K6_RC: ${{ steps.k6.outputs.rc }}
           REPORT_RC: ${{ steps.report.outputs.rc }}
