@@ -1,0 +1,106 @@
+# The external probe of staging (B9 plan Task 5, decision 3; ALERTS): every 5 minutes,
+# from outside OCI, scripts/validation/probe.sh of the private main signs a synthetic
+# user in through qa-replay, logs a typed meal, reads it on Today and deletes it, each
+# step within its PERFORMANCE_GOALS budget plus a 170 ms round-trip allowance.
+#
+# One failed probe does not fail the run: the run fails when this probe and the one
+# before it both failed, so GitHub's workflow-failure mail reaches the owner after two
+# in a row. Every run keeps its result (step names, statuses, timings; no key, code or
+# token) as the artifact probe-<run id> for 30 days: the 7-day count reads them, and a
+# gap of more than 15 minutes between runs counts as a miss (GitHub may start a
+# scheduled run late).
+#
+# QA_SIGNIN_KEY is the build farm's copy of the staging qa-replay key (owner-gated, B9
+# decision 2; docs/operations/SECRETS.md). Until it is set, or until probe.sh is on
+# the private main, each run records "skipped" and passes. Logs are public: the key
+# reaches probe.sh only through its environment and is never printed.
+name: farm-probe
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Full commit SHA of Mom-s-Food/goodfood-main to take probe.sh from; empty takes main'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: farm-probe
+  cancel-in-progress: false
+
+env:
+  PRIVATE_REPO: Mom-s-Food/goodfood-main
+  GOODFOOD_API_URL: https://api.64-181-241-30.sslip.io
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Validate the request
+        env:
+          REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          [ -z "$REF" ] || printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::source_ref must be a full lowercase commit SHA"; exit 1; }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ inputs.source_ref || 'main' }}
+          persist-credentials: false
+          sparse-checkout: scripts
+      - name: Probe staging
+        id: probe
+        env:
+          QA_SIGNIN_KEY: ${{ secrets.QA_SIGNIN_KEY }}
+        run: |
+          set -uo pipefail
+          mkdir -p probe-result
+          if [ ! -f scripts/validation/probe.sh ]; then
+            echo "::notice::scripts/validation/probe.sh is not on the private main yet; skipped"
+            echo '{"ok": null, "skipped": "no probe.sh"}' > probe-result/result.json
+            echo "ok=skipped" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ -z "$QA_SIGNIN_KEY" ]; then
+            echo "::notice::the QA_SIGNIN_KEY farm secret is not set (B9 decision 2); skipped"
+            echo '{"ok": null, "skipped": "no QA_SIGNIN_KEY"}' > probe-result/result.json
+            echo "ok=skipped" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if bash scripts/validation/probe.sh --env staging --result probe-result/result.json; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            [ -s probe-result/result.json ] || echo '{"ok": false}' > probe-result/result.json
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() }}
+        with:
+          name: probe-${{ github.run_id }}
+          path: probe-result/result.json
+          retention-days: 30
+      - name: Two failed probes in a row fail the run
+        if: ${{ steps.probe.outputs.ok == 'false' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          prev="$(gh run list -R "$REPO" --workflow farm-probe.yml --status completed --limit 10 --json databaseId \
+            --jq "[.[] | select(.databaseId != $RUN_ID)][0].databaseId // empty")"
+          if [ -z "$prev" ]; then echo "::warning::the probe failed; no earlier run to compare"; exit 0; fi
+          mkdir -p prev
+          if ! gh run download "$prev" -R "$REPO" -n "probe-$prev" -D prev > /dev/null 2>&1; then
+            echo "::warning::the probe failed; the earlier run $prev kept no result"; exit 0
+          fi
+          if [ "$(jq -r '.ok' prev/result.json)" = "false" ]; then
+            echo "::error::the probe failed twice in a row (this run and run $prev)"; exit 1
+          fi
+          echo "::warning::the probe failed once (run $prev before it passed); the next failure fails the run"
