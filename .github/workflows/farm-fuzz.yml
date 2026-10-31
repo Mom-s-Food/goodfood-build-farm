@@ -1,0 +1,290 @@
+# Long fuzz runs (T9; B9 plan Task 21) of every cargo-fuzz target of the private
+# Mom-s-Food/goodfood-main repository: each folder backend/crates/<crate>/fuzz/ with a
+# Cargo.toml is a target set, and every [[bin]] in it is one matrix job. Runs nightly on
+# main and by hand on any commit.
+#
+# Logs and artifacts of a public repository are public. The fuzz inputs are synthetic (the
+# committed seeds are built from synthetic fixtures and the targets use synthetic keys);
+# nothing here reads or prints a secret beyond the checkout token.
+#
+# Layout:
+#   setup: pin the commit, list the targets
+#   build (one job per crate): cargo fuzz build -O --debug-assertions (AddressSanitizer)
+#   fuzz (one job per target): restore the target's corpus from the newest artifact of an
+#     earlier run, run -max_total_time seconds over corpus + the committed seeds, merge the
+#     corpus down, upload it (90 days) with the run's stats, and any crash input (fails the job)
+#   report: one table of every target's time, executions and corpus size in the run summary
+# A crash input is fixed in its owning crate with the input added to that crate's
+# fuzz/seeds/<target>/, which its tests/fuzz_seeds.rs replays in farm-ci forever after.
+name: farm-fuzz
+
+on:
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Full commit SHA of Mom-s-Food/goodfood-main; empty fuzzes main'
+        required: false
+        default: ''
+      seconds:
+        description: 'Fuzzing seconds per target (60 to 18000)'
+        required: false
+        default: '1800'
+      targets:
+        description: 'Space-separated crate/target names to run (e.g. billing/apple_jws); empty runs every target'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: farm-fuzz-${{ inputs.source_ref || 'main' }}
+  cancel-in-progress: false
+
+env:
+  PRIVATE_REPO: Mom-s-Food/goodfood-main
+  # A pinned nightly: cargo-fuzz needs -Zsanitizer. Move it forward on purpose, not by accident.
+  NIGHTLY: nightly-2026-10-15
+  CARGO_FUZZ_VERSION: 0.13.1
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  setup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      source_ref: ${{ steps.pin.outputs.source_ref }}
+      crates: ${{ steps.list.outputs.crates }}
+      targets: ${{ steps.list.outputs.targets }}
+      seconds: ${{ steps.check.outputs.seconds }}
+    steps:
+      - name: Validate the request
+        id: check
+        env:
+          REQUESTED: ${{ inputs.source_ref }}
+          SECONDS_IN: ${{ inputs.seconds || '1800' }}
+          TARGETS: ${{ inputs.targets }}
+        run: |
+          set -euo pipefail
+          if [ -n "$REQUESTED" ] && ! printf '%s' "$REQUESTED" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::source_ref must be a full lowercase commit SHA"; exit 1
+          fi
+          printf '%s' "$SECONDS_IN" | grep -Eq '^[0-9]{2,5}$' || { echo "::error::seconds must be a number"; exit 1; }
+          [ "$SECONDS_IN" -ge 60 ] && [ "$SECONDS_IN" -le 18000 ] || { echo "::error::seconds must be 60 to 18000"; exit 1; }
+          [ -z "$TARGETS" ] || printf '%s' "$TARGETS" | grep -Eq '^[a-z0-9_/ -]{1,800}$' || { echo "::error::bad targets"; exit 1; }
+          echo "seconds=$SECONDS_IN" >> "$GITHUB_OUTPUT"
+      - name: Check out the private source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ inputs.source_ref || 'main' }}
+          persist-credentials: false
+      - name: Pin the exact commit
+        id: pin
+        run: printf 'source_ref=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: List the targets
+        id: list
+        env:
+          TARGETS: ${{ inputs.targets }}
+        run: |
+          set -euo pipefail
+          python3 -I - "$TARGETS" >> "$GITHUB_OUTPUT" <<'PY'
+          import glob, json, sys, tomllib
+          wanted = set(sys.argv[1].split())
+          targets = []
+          for manifest in sorted(glob.glob("backend/crates/*/fuzz/Cargo.toml")):
+              crate = manifest.split("/")[2]
+              with open(manifest, "rb") as f:
+                  bins = tomllib.load(f).get("bin", [])
+              for b in bins:
+                  if not wanted or f"{crate}/{b['name']}" in wanted:
+                      targets.append({"crate": crate, "target": b["name"]})
+          if not targets:
+              sys.exit("no fuzz target matches")
+          crates = sorted({t["crate"] for t in targets})
+          print("crates=" + json.dumps(crates))
+          print("targets=" + json.dumps(targets))
+          print(f"{len(targets)} targets in {len(crates)} crates", file=sys.stderr)
+          PY
+
+  build:
+    name: build ${{ matrix.crate }}
+    needs: setup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: ${{ fromJSON(needs.setup.outputs.crates) }}
+    steps:
+      - name: Check out the pinned private source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ needs.setup.outputs.source_ref }}
+          persist-credentials: false
+      - name: Rust toolchain (pinned nightly)
+        run: rustup toolchain install "$NIGHTLY" --profile minimal --no-self-update
+      - name: cargo-fuzz
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: cargo-fuzz@${{ env.CARGO_FUZZ_VERSION }}
+      - name: Build every target of ${{ matrix.crate }}
+        working-directory: backend/crates/${{ matrix.crate }}/fuzz
+        run: |
+          set -euo pipefail
+          # The backend's lock file as the starting point, so the fuzz build uses the same
+          # dependency versions as farm-ci (cargo adds only libfuzzer-sys and the like).
+          cp ../../../Cargo.lock Cargo.lock
+          cargo "+$NIGHTLY" fuzz build -O --debug-assertions
+          out="$RUNNER_TEMP/bins"; mkdir -p "$out"
+          for b in $(python3 -I -c 'import tomllib; print(" ".join(b["name"] for b in tomllib.load(open("Cargo.toml","rb"))["bin"]))'); do
+            cp "target/x86_64-unknown-linux-gnu/release/$b" "$out/"
+          done
+          tar -C "$out" -czf "$RUNNER_TEMP/fuzz-bin.tgz" .
+          ls -la "$out"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-bin-${{ matrix.crate }}
+          path: ${{ runner.temp }}/fuzz-bin.tgz
+          retention-days: 1
+
+  fuzz:
+    name: fuzz ${{ matrix.crate }}/${{ matrix.target }}
+    needs: [setup, build]
+    if: ${{ !cancelled() && needs.setup.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.setup.outputs.targets) }}
+    env:
+      CRATE: ${{ matrix.crate }}
+      TARGET: ${{ matrix.target }}
+      SECONDS_PER_TARGET: ${{ needs.setup.outputs.seconds }}
+    steps:
+      - name: Check out the committed seeds
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ needs.setup.outputs.source_ref }}
+          persist-credentials: false
+          sparse-checkout: backend/crates/${{ matrix.crate }}/fuzz
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: fuzz-bin-${{ matrix.crate }}
+          path: ${{ runner.temp }}
+      - name: Restore the corpus of an earlier run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/corpus" "$RUNNER_TEMP/bin"
+          tar -C "$RUNNER_TEMP/bin" -xzf "$RUNNER_TEMP/fuzz-bin.tgz"
+          name="fuzz-corpus-$CRATE-$TARGET"
+          id="$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$name&per_page=20" \
+            --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .id // empty')"
+          if [ -n "$id" ]; then
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "$RUNNER_TEMP/corpus.zip"
+            unzip -q "$RUNNER_TEMP/corpus.zip" -d "$RUNNER_TEMP/prev"
+            tar -C "$RUNNER_TEMP/corpus" -xzf "$RUNNER_TEMP/prev/corpus.tgz"
+            echo "restored artifact $id: $(find "$RUNNER_TEMP/corpus" -type f | wc -l) inputs"
+          else
+            echo "no earlier corpus: starting from the seeds"
+          fi
+      - name: Fuzz ${{ matrix.crate }}/${{ matrix.target }} for ${{ needs.setup.outputs.seconds }} seconds
+        id: run
+        run: |
+          set -uo pipefail
+          seeds="backend/crates/$CRATE/fuzz/seeds/$TARGET"
+          mkdir -p "$seeds" "$RUNNER_TEMP/artifacts"
+          start=$(date +%s)
+          "$RUNNER_TEMP/bin/$TARGET" "$RUNNER_TEMP/corpus" "$seeds" \
+            -max_total_time="$SECONDS_PER_TARGET" -timeout=25 -rss_limit_mb=2560 -max_len=65536 \
+            -print_final_stats=1 -artifact_prefix="$RUNNER_TEMP/artifacts/" > "$RUNNER_TEMP/fuzz.log" 2>&1
+          rc=$?
+          # The progress lines are noise; the rest (start, stats, any failure) is kept.
+          grep -Ev '^#[0-9]+[[:space:]]+(NEW|REDUCE|pulse|INITED|DONE)' "$RUNNER_TEMP/fuzz.log" | tail -150 || true
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          echo "elapsed=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: Merge the corpus down and record the stats
+        if: ${{ !cancelled() }}
+        env:
+          RC: ${{ steps.run.outputs.rc }}
+          ELAPSED: ${{ steps.run.outputs.elapsed }}
+          SOURCE_REF: ${{ needs.setup.outputs.source_ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/merged" "$RUNNER_TEMP/out"
+          "$RUNNER_TEMP/bin/$TARGET" -merge=1 "$RUNNER_TEMP/merged" "$RUNNER_TEMP/corpus" \
+            "backend/crates/$CRATE/fuzz/seeds/$TARGET" -timeout=25 -rss_limit_mb=2560 > /dev/null 2>&1 || true
+          tar -C "$RUNNER_TEMP/merged" -czf "$RUNNER_TEMP/out/corpus.tgz" .
+          execs="$(grep -oE 'stat::number_of_executed_units: [0-9]+' "$RUNNER_TEMP/fuzz.log" | awk '{print $2}' | tail -1)"
+          crashes="$(find "$RUNNER_TEMP/artifacts" -type f | wc -l)"
+          inputs="$(find "$RUNNER_TEMP/merged" -type f | wc -l)"
+          python3 -I - > "$RUNNER_TEMP/out/stats.json" <<PY
+          import json
+          print(json.dumps({"crate": "$CRATE", "target": "$TARGET", "seconds": int("${ELAPSED:-0}"),
+                            "execs": int("${execs:-0}"), "corpus": int("$inputs"), "crashes": int("$crashes"),
+                            "exit": int("${RC:-1}"), "source_ref": "$SOURCE_REF", "run_id": "$GITHUB_RUN_ID"}))
+          PY
+          cat "$RUNNER_TEMP/out/stats.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: fuzz-corpus-${{ matrix.crate }}-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/out/corpus.tgz
+            ${{ runner.temp }}/out/stats.json
+          retention-days: 90
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() && steps.run.outputs.rc != '0' }}
+        with:
+          name: fuzz-crash-${{ matrix.crate }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/artifacts/
+          if-no-files-found: ignore
+          retention-days: 90
+      - name: Fail on a crash
+        if: ${{ !cancelled() }}
+        env:
+          RC: ${{ steps.run.outputs.rc }}
+        run: |
+          if [ "$RC" != "0" ]; then
+            grep -E 'ERROR: libFuzzer|SUMMARY:|panicked at|Test unit written' "$RUNNER_TEMP/fuzz.log" | head -20 || true
+            echo "::error::$CRATE/$TARGET found a failing input (artifact fuzz-crash-$CRATE-$TARGET)"; exit 1
+          fi
+
+  report:
+    needs: [setup, fuzz]
+    if: ${{ !cancelled() && needs.setup.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: fuzz-corpus-*
+          path: ${{ runner.temp }}/stats
+      - name: Summary of every target
+        env:
+          SOURCE_REF: ${{ needs.setup.outputs.source_ref }}
+        run: |
+          set -euo pipefail
+          python3 -I - "$RUNNER_TEMP/stats" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import glob, json, os, sys
+          rows = [json.load(open(p)) for p in sorted(glob.glob(os.path.join(sys.argv[1], "*", "stats.json")))]
+          print(f"### farm-fuzz on {os.environ['SOURCE_REF'][:12]}\n")
+          print("| target | seconds | executions | corpus | crashes | exit |")
+          print("| --- | ---: | ---: | ---: | ---: | ---: |")
+          for r in rows:
+              print(f"| {r['crate']}/{r['target']} | {r['seconds']} | {r['execs']} | {r['corpus']} | {r['crashes']} | {r['exit']} |")
+          PY
+          cat "$GITHUB_STEP_SUMMARY"
