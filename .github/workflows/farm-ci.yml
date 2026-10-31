@@ -500,6 +500,9 @@ jobs:
       - name: Spectral and oasdiff (T3)
         if: ${{ !cancelled() }}
         run: scripts/contracts/breaking-check.sh --base "${{ steps.base.outputs.base }}"
+      - name: Migrations that already landed are never renamed, edited or deleted
+        if: ${{ !cancelled() }}
+        run: python3 -I scripts/ci/check-migrations-immutable.py --base "${{ steps.base.outputs.base }}"
       - name: Black-box journeys compile (tests/, go vet and go build; nothing runs against a server)
         if: ${{ !cancelled() }}
         working-directory: tests
