@@ -606,12 +606,18 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
+      # cancelled() works only in an if: condition, so a step records it for the report.
+      - name: Was the run cancelled
+        id: run
+        if: ${{ cancelled() }}
+        run: echo "cancelled=true" >> "$GITHUB_OUTPUT"
       - name: Report the result to the private commit
+        if: ${{ always() }}
         env:
           GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
           SHA: ${{ needs.setup.outputs.source_ref }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          CANCELLED: ${{ cancelled() }}
+          CANCELLED: ${{ steps.run.outputs.cancelled == 'true' }}
           SETUP: ${{ needs.setup.result }}
           RUST: ${{ needs.rust.result }}
           SUPPLY: ${{ needs.supply-chain.result }}
