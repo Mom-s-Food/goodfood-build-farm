@@ -10,6 +10,11 @@
 # step through its environment; the script passes it to curl on stdin, never prints it, and
 # refuses to keep a report that carries it or a token. Until the secret exists the run says so
 # and stops green, so the schedule can be in place before the owner's approval.
+# Artifacts of a public repository are public too: a real finding must not be published before
+# it is fixed. The scan runs with --public-log, so this log shows only counts of alerts per level
+# (no alert names, plugin ids, URLs or ZAP output), and the reports are kept only encrypted with
+# age to the owner's public key in the repository variable ZAP_REPORT_AGE_RECIPIENT (a public
+# key, not a secret). Until that variable exists no report is kept at all.
 # Production is never scanned: the script refuses --env production and any server whose
 # /v1/config reports another environment. A schedule runs only this repository's own workflow
 # on the private main, never code from a fork.
@@ -37,6 +42,8 @@ env:
   PRIVATE_REPO: Mom-s-Food/goodfood-main
   # The staging API (ADR-0018: the free node's load balancer).
   GOODFOOD_API_URL: https://api.64-181-241-30.sslip.io
+  # The owner's age public key (age1...); empty keeps no report.
+  ZAP_REPORT_RECIPIENT: ${{ vars.ZAP_REPORT_AGE_RECIPIENT }}
 
 jobs:
   zap:
@@ -71,6 +78,13 @@ jobs:
           token: ${{ secrets.PRIVATE_REPO_PAT }}
           ref: ${{ inputs.source_ref || 'main' }}
           persist-credentials: false
+      - name: Install age
+        if: steps.key.outputs.ready == 'true' && env.ZAP_REPORT_RECIPIENT != ''
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends age
+          age --version
       - name: ZAP scan of staging
         if: steps.key.outputs.ready == 'true'
         env:
@@ -78,12 +92,20 @@ jobs:
         run: |
           set -euo pipefail
           echo "source $(git rev-parse HEAD)"
-          scripts/test/security-scan.sh --dast --env staging --report-dir "$RUNNER_TEMP/zap"
-      - name: Keep the reports
-        if: ${{ !cancelled() && steps.key.outputs.ready == 'true' }}
+          mkdir -p "$RUNNER_TEMP/zap"
+          keep=()
+          if [ -n "$ZAP_REPORT_RECIPIENT" ]; then
+            keep=(--encrypt-to "$ZAP_REPORT_RECIPIENT")
+          else
+            echo "::warning::ZAP_REPORT_AGE_RECIPIENT is not a variable of this repository; no report is kept"
+          fi
+          scripts/test/security-scan.sh --dast --env staging --public-log "${keep[@]}" --report-dir "$RUNNER_TEMP/zap"
+      - name: Keep the encrypted reports
+        if: ${{ !cancelled() && steps.key.outputs.ready == 'true' && env.ZAP_REPORT_RECIPIENT != '' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: zap-report-${{ github.run_id }}
-          path: ${{ runner.temp }}/zap
+          # Only the age ciphertext: never a plaintext report from a public repository.
+          path: ${{ runner.temp }}/zap/*.age
           if-no-files-found: warn
           retention-days: 30
