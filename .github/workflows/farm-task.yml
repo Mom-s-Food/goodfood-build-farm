@@ -10,7 +10,10 @@
 #                     the synthetic recordings (no key, no model call) of the held-out split on
 #                     the default grid; commits backend/testdata/recordings/ and evals/
 #   fmt               cargo fmt --all; commits backend/
-# Never runs on main, never on a tag, never anything but the three tasks above.
+#   contracts         scripts/contracts/generate-rs.sh with openapi-to-rust 0.23.0 (the
+#                     generated API models and operation table from contracts/openapi);
+#                     commits backend/crates/api-types/
+# Never runs on main, never on a tag, never anything but the four tasks above.
 # Cache: Swatinem/rust-cache as in farm-ci.yml (compiled dependencies only, no workspace
 # crates or incremental state), one shared entry per Cargo.lock and toolchain.
 name: farm-task
@@ -22,10 +25,10 @@ on:
         description: 'Branch of Mom-s-Food/goodfood-main (not main)'
         required: true
       task:
-        description: 'gen-cases, write-recordings or fmt'
+        description: 'gen-cases, write-recordings, fmt or contracts'
         required: true
         type: choice
-        options: [gen-cases, write-recordings, fmt]
+        options: [gen-cases, write-recordings, fmt, contracts]
       suite:
         description: 'gen-cases and write-recordings: one suite name; empty does every suite'
         required: false
@@ -93,6 +96,9 @@ jobs:
                 cargo run --quiet --locked -p goodfood-evals --bin evals -- --root ../evals --write-recordings testdata/recordings
               fi ;;
             fmt) cargo fmt --all ;;
+            contracts)
+              cargo install --quiet --locked openapi-to-rust --version 0.23.0
+              (cd .. && scripts/contracts/generate-rs.sh) ;;
           esac
       - name: Commit and push the result to the branch
         env:
@@ -107,6 +113,7 @@ jobs:
             gen-cases) owned='^(evals/)' ;;
             write-recordings) owned='^(backend/testdata/recordings/|evals/)' ;;
             fmt) owned='^(backend/)' ;;
+            contracts) owned='^(backend/crates/api-types/)' ;;
           esac
           stray=$(git status --porcelain --untracked-files=all | cut -c4- | grep -Ev "$owned" || true)
           if [ -n "$stray" ]; then
