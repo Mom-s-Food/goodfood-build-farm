@@ -1,0 +1,89 @@
+# The nightly OWASP ZAP API scan of staging (lane T9, Phase 1 gate G14) for the private
+# Mom-s-Food/goodfood-main repository. It runs scripts/test/security-scan.sh --dast --env staging
+# from the private source: a fresh synthetic user (qa+zap-<run>@synthetic.goodfood.test) signs in
+# through the staging-only qa-replay route, ZAP (pinned by digest in the script) scans every
+# contract operation and the connector routes, the user is deleted, and a High-risk alert fails
+# the run unless a reviewed row of tests/security/zap/rules.tsv says otherwise.
+#
+# Logs of a public repository are public. QA_SIGNIN_KEY (the staging qa-replay key, a repository
+# secret added through SECRETS.md "Adding a new credential", B9 decision 2) reaches only the scan
+# step through its environment; the script passes it to curl on stdin, never prints it, and
+# refuses to keep a report that carries it or a token. Until the secret exists the run says so
+# and stops green, so the schedule can be in place before the owner's approval.
+# Production is never scanned: the script refuses --env production and any server whose
+# /v1/config reports another environment. A schedule runs only this repository's own workflow
+# on the private main, never code from a fork.
+name: farm-zap
+
+on:
+  schedule:
+    # 02:40 UTC nightly; GitHub may start a scheduled run late.
+    - cron: '40 2 * * *'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Full commit SHA of Mom-s-Food/goodfood-main for the plan, rules and script; empty uses main'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: farm-zap
+  cancel-in-progress: false
+
+env:
+  PRIVATE_REPO: Mom-s-Food/goodfood-main
+  # The staging API (ADR-0018: the free node's load balancer).
+  GOODFOOD_API_URL: https://api.64-181-241-30.sslip.io
+
+jobs:
+  zap:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Is the qa-replay key on the farm
+        id: key
+        env:
+          QA_SIGNIN_KEY: ${{ secrets.QA_SIGNIN_KEY }}
+        run: |
+          if [ -n "$QA_SIGNIN_KEY" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::QA_SIGNIN_KEY is not a secret of this repository yet (B9 decision 2); nothing scanned"
+          fi
+      - name: Validate the request
+        if: steps.key.outputs.ready == 'true'
+        env:
+          REQUESTED: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "$REQUESTED" ] && ! printf '%s' "$REQUESTED" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::source_ref must be a full lowercase commit SHA"; exit 1
+          fi
+      - name: Check out the private source
+        if: steps.key.outputs.ready == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ inputs.source_ref || 'main' }}
+          persist-credentials: false
+      - name: ZAP scan of staging
+        if: steps.key.outputs.ready == 'true'
+        env:
+          QA_SIGNIN_KEY: ${{ secrets.QA_SIGNIN_KEY }}
+        run: |
+          set -euo pipefail
+          echo "source $(git rev-parse HEAD)"
+          scripts/test/security-scan.sh --dast --env staging --report-dir "$RUNNER_TEMP/zap"
+      - name: Keep the reports
+        if: ${{ !cancelled() && steps.key.outputs.ready == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zap-report-${{ github.run_id }}
+          path: ${{ runner.temp }}/zap
+          if-no-files-found: warn
+          retention-days: 30
