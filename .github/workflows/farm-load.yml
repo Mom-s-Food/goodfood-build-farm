@@ -113,7 +113,7 @@ jobs:
           go-version-file: tests/go.mod
           cache: false
       # The checks that need no server: the budget table against PERFORMANCE_GOALS, the
-      # write accounting and the stress arithmetic (farm-ci only compiles tests/).
+      # write accounting and the stress arithmetic (farm-ci runs them too, on every PR).
       - name: tests/load checks that need no server
         run: go -C tests test -count=1 -run 'TestBudgetTable|TestWriteAccounting|TestStressAnalysis|TestSummaryShape' ./load/
       - name: Staging is up and is staging

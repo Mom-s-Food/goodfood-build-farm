@@ -532,6 +532,17 @@ jobs:
           go vet ./...
           go build ./...
           go test -count=1 -run '^$' ./...
+      # tests/load checks that need no server: budgets.json against PERFORMANCE_GOALS §3.1
+      # (so a budget change cannot merge while k6's thresholds keep the old numbers), the
+      # write accounting, the stress arithmetic, the budget gating and lib.js's node tests
+      # (target allowlist, duplicate counting; node 22 is set up above). Skipped on commits
+      # from before tests/load had them.
+      - name: tests/load checks that need no server (budget drift, write accounting)
+        if: ${{ !cancelled() && hashFiles('tests/load/budgets.json') != '' }}
+        working-directory: tests
+        env:
+          LOAD_REQUIRE_NODE: '1'
+        run: go test -count=1 -run 'TestBudgetTable|TestWriteAccounting|TestStressAnalysis|TestSummaryShape|TestBudgetUnmet|TestLoadLib' ./load/
       # The compatibility-replay harness and every committed archive against a mirror (no
       # backend; farm-replay.yml replays them against the local stack). Skipped on commits
       # from before the harness existed (B9 Task 23).
