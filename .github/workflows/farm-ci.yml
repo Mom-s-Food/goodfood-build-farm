@@ -67,11 +67,28 @@ jobs:
       - name: Validate the request
         env:
           REQUESTED: ${{ github.event.client_payload.source_ref || inputs.source_ref }}
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
         run: |
           set -euo pipefail
           if [ -n "$REQUESTED" ] && ! printf '%s' "$REQUESTED" | grep -Eq '^[0-9a-f]{40}$'; then
             echo "::error::source_ref must be a full lowercase commit SHA"; exit 1
           fi
+          [ -n "$REQUESTED" ] || exit 0
+          # A SHA that does not exist (mistyped, or only its prefix is real) fails here at once
+          # instead of in the checkout's retry loop ('not our ref'). Dispatch with the output of
+          # `git rev-parse <branch>`. Any other API error falls through to the checkout.
+          for i in 1 2 3; do
+            if out="$(gh api "repos/$PRIVATE_REPO/commits/$REQUESTED" --jq .sha 2>&1)"; then
+              [ "$out" = "$REQUESTED" ] && exit 0
+              echo "::error::source_ref $REQUESTED resolves to $out; dispatch the full SHA from git rev-parse"; exit 1
+            fi
+            if grep -qE 'No commit found|HTTP 404|HTTP 422' <<<"$out"; then
+              echo "::error::source_ref $REQUESTED is not a commit of $PRIVATE_REPO (not pushed, or typed by hand); dispatch the output of git rev-parse <branch>"
+              exit 1
+            fi
+            sleep $((i * 5))
+          done
+          echo "::warning::could not look $REQUESTED up; the checkout decides"
       - name: Resolve the private source once
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -167,6 +184,7 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false
+      max-parallel: 3
       matrix:
         partition: [1, 2, 3]
     env:
@@ -500,8 +518,10 @@ jobs:
       - name: Spectral and oasdiff (T3)
         if: ${{ !cancelled() }}
         run: scripts/contracts/breaking-check.sh --base "${{ steps.base.outputs.base }}"
+      # Skipped on commits from before the check existed (goodfood-main d3f0e14): a work branch
+      # that has not merged main since must not fail on a missing script.
       - name: Migrations that already landed are never renamed, edited or deleted
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && hashFiles('scripts/ci/check-migrations-immutable.py') != '' }}
         run: python3 -I scripts/ci/check-migrations-immutable.py --base "${{ steps.base.outputs.base }}"
       - name: Black-box journeys compile (tests/, go vet and go build; nothing runs against a server)
         if: ${{ !cancelled() }}
@@ -579,9 +599,10 @@ jobs:
 
   report:
     needs: [setup, rust, supply-chain, scripts]
-    # Not on a cancelled run: a superseded run must not overwrite the status of the run that
-    # replaced it. A job that timed out still counts (its result is not success).
-    if: ${{ !cancelled() && needs.setup.outputs.source_ref != '' }}
+    # Also on a cancelled run once setup has posted pending, so farm/ci never stays pending:
+    # a cancelled run posts error, but only while farm/ci still points at this run, so a run
+    # that superseded it keeps its own status. A job that timed out counts as failed.
+    if: ${{ always() && needs.setup.outputs.source_ref != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -590,13 +611,21 @@ jobs:
           GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
           SHA: ${{ needs.setup.outputs.source_ref }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CANCELLED: ${{ cancelled() }}
           SETUP: ${{ needs.setup.result }}
           RUST: ${{ needs.rust.result }}
           SUPPLY: ${{ needs.supply-chain.result }}
           SCRIPTS: ${{ needs.scripts.result }}
         run: |
           set -euo pipefail
-          if [ "$SETUP" = success ] && [ "$RUST" = success ] && [ "$SUPPLY" = success ] \
+          if [ "$CANCELLED" = true ] || [[ " $SETUP $RUST $SUPPLY $SCRIPTS " == *" cancelled "* ]]; then
+            current="$(gh api "repos/$PRIVATE_REPO/commits/$SHA/status" \
+              --jq '[.statuses[] | select(.context == "farm/ci")][0].target_url // ""')"
+            if [ "$current" != "$RUN_URL" ]; then
+              echo "run cancelled; $STATUS_CONTEXT points at ${current:-nothing} and is left as it is"; exit 0
+            fi
+            state=error; desc="cancelled (rust=$RUST supply-chain=$SUPPLY scripts=$SCRIPTS); re-dispatch farm-ci"
+          elif [ "$SETUP" = success ] && [ "$RUST" = success ] && [ "$SUPPLY" = success ] \
              && [ "$SCRIPTS" = success ]; then
             state=success; desc="Build farm checks passed"
           else
