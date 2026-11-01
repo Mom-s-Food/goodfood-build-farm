@@ -14,6 +14,15 @@
 # Logs are public: the tests' data is synthetic and nothing here prints a secret.
 name: farm-perf
 
+# EXPERIMENT (branch t8-cpu-pin, never merged to the default branch): the runner's four CPUs are divided between
+# PostgreSQL, the api pods and the worker, so none of them takes cores from another, as separate nodes would give:
+#   layout a (default): api pods CPUs 0-1, worker CPU 2, PostgreSQL CPU 3
+#   layout b:           api pods and worker CPUs 0-1, PostgreSQL CPUs 2-3
+# PostgreSQL is pinned with docker --cpuset-cpus. The test process is pinned with taskset to the pods' CPUs, and its
+# worker-runtime threads (named t-worker, the T8 test's second runtime) are moved to the worker's CPUs by a loop
+# beside the test. Only test_rerank_lag_under_load runs, and the result is posted as farm/perf-cpu-pin so the
+# commit's farm/perf is left alone. What this does and does not model is in the T8 report that asked for it.
+
 on:
   workflow_dispatch:
     inputs:
@@ -21,6 +30,10 @@ on:
         description: 'Full commit SHA of Mom-s-Food/goodfood-main; empty measures main'
         required: false
         default: ''
+      layout:
+        description: 'CPU layout: a (pods 0-1, worker 2, PostgreSQL 3) or b (pods and worker 0-1, PostgreSQL 2-3)'
+        required: false
+        default: 'a'
   schedule:
     # Mondays 06:17 UTC: main, weekly.
     - cron: '17 6 * * 1'
@@ -37,7 +50,8 @@ concurrency:
 
 env:
   PRIVATE_REPO: Mom-s-Food/goodfood-main
-  STATUS_CONTEXT: farm/perf
+  STATUS_CONTEXT: farm/perf-cpu-pin
+  LAYOUT: ${{ inputs.layout || 'a' }}
 
 jobs:
   perf:
@@ -58,9 +72,21 @@ jobs:
             echo "::error::source_ref must be a full lowercase commit SHA"; exit 1
           fi
       # The same throwaway server as farm-ci: data on tmpfs, no fsync, no full-page writes.
+      - name: The CPU layout
+        run: |
+          set -euo pipefail
+          n=$(nproc)
+          echo "nproc: $n; $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)"
+          if [ "$n" -lt 4 ]; then echo "::error::the layouts need 4 CPUs, the runner has $n"; exit 1; fi
+          case "$LAYOUT" in
+            a) echo "layout a: api pods CPUs 0-1, worker CPU 2, PostgreSQL CPU 3" ;;
+            b) echo "layout b: api pods and worker CPUs 0-1, PostgreSQL CPUs 2-3" ;;
+            *) echo "::error::layout must be a or b"; exit 1 ;;
+          esac
       - name: Start PostgreSQL 18 (tmpfs, fsync off)
         run: |
-          docker run -d --name pg -p 5432:5432 -e POSTGRES_PASSWORD=goodfood \
+          case "$LAYOUT" in a) pg_cpus=3 ;; b) pg_cpus=2-3 ;; esac
+          docker run -d --name pg -p 5432:5432 -e POSTGRES_PASSWORD=goodfood --cpuset-cpus="$pg_cpus" \
             --tmpfs /var/lib/postgresql:rw,size=8g \
             postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873 \
             -c fsync=off -c synchronous_commit=off -c full_page_writes=off \
@@ -99,7 +125,11 @@ jobs:
         id: list
         run: |
           set -euo pipefail
-          python3 -I scripts/test/req-coverage.py --lane-tests T8 > "$RUNNER_TEMP/t8.tsv"
+          python3 -I scripts/test/req-coverage.py --lane-tests T8 > "$RUNNER_TEMP/t8-all.tsv"
+          # The experiment runs only the re-rank burst.
+          awk -F'\t' -v OFS='\t' '$1 == "rest" && $2 == "b7_t8" {print $1, $2, "test_rerank_lag_under_load"}' \
+            "$RUNNER_TEMP/t8-all.tsv" > "$RUNNER_TEMP/t8.tsv"
+          test -s "$RUNNER_TEMP/t8.tsv"
           cat "$RUNNER_TEMP/t8.tsv"
       - name: Build the tests (release)
         working-directory: backend
@@ -132,13 +162,38 @@ jobs:
           logs="$RUNNER_TEMP/t8-logs"; mkdir -p "$logs"
           : > "$RUNNER_TEMP/t8-results.tsv"
           rc=0
+          case "$LAYOUT" in a) worker_cpus=2 ;; b) worker_cpus=0-1 ;; esac
+          docker inspect -f 'PostgreSQL cpuset: {{.HostConfig.CpusetCpus}}' pg
+          echo "layout $LAYOUT: test process CPUs 0-1, worker-runtime threads (t-worker) CPUs $worker_cpus"
+          # Moves each thread of the test's worker runtime to the worker's CPUs as it appears, and reports once which
+          # CPUs every kind of thread of the test may run on.
+          pin_worker_threads() {
+            while true; do
+              for f in $(grep -l -x 't-worker' /proc/[0-9]*/task/*/comm 2>/dev/null); do
+                tid="${f#/proc/*/task/}"; tid="${tid%/comm}"
+                taskset -p -c "$worker_cpus" "$tid" > /dev/null 2>&1
+              done
+              sleep 0.2
+            done
+          }
+          pin_worker_threads &
+          pin_pid=$!
+          (
+            until grep -q -x 't-worker' /proc/[0-9]*/task/*/comm 2>/dev/null; do sleep 0.2; done
+            sleep 6
+            echo "CPU-PIN thread affinities (count, name, CPUs allowed):"
+            for s in /proc/[0-9]*/task/*/status; do
+              awk '/^Name:/{n=$2} /^Cpus_allowed_list:/{c=$2} END{print n, c}' "$s" 2>/dev/null
+            done | sort | uniq -c | sort -rn | head -12
+          ) &
+          report_pid=$!
           while IFS=$'\t' read -r pkg tgt names; do
             case "$tgt" in lib) f=(--lib) ;; bin) f=(--bins) ;; *) f=(--test "$tgt") ;; esac
             IFS='|' read -ra want <<< "$names"
             log="$logs/$pkg-$tgt.log"
             echo "::group::$pkg ($tgt): $names"
             start=$(date +%s)
-            cargo test --release --locked -p "$pkg" "${f[@]}" -- \
+            taskset -c 0-1 cargo test --release --locked -p "$pkg" "${f[@]}" -- \
               --include-ignored --test-threads=1 --show-output "${want[@]}" 2>&1 | tee "$log"
             secs=$(( $(date +%s) - start ))
             echo "::endgroup::"
@@ -150,6 +205,7 @@ jobs:
               [ "$r" = passed ] || echo "::error::T8 $pkg ($tgt) $n: $r"
             done
           done < "$RUNNER_TEMP/t8.tsv"
+          kill "$pin_pid" "$report_pid" 2>/dev/null || true
           exit $rc
       - name: Timing report
         if: ${{ !cancelled() && steps.list.outcome == 'success' }}
@@ -164,6 +220,8 @@ jobs:
             echo "## Lane T8 timing report"
             echo
             echo "Commit \`$SHA\`, $(date -u +%Y-%m-%dT%H:%MZ)."
+            echo "CPU layout $LAYOUT (experiment t8-cpu-pin): a = api pods 0-1, worker 2, PostgreSQL 3; b = pods and worker 0-1, PostgreSQL 2-3."
+            echo
             echo "Runner: $(nproc) vCPU, $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs),"
             echo "$(awk '/MemTotal/ {printf "%.1f GB", $2/1048576}' /proc/meminfo) RAM; PostgreSQL 18 on tmpfs, fsync off."
             echo
