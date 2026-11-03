@@ -1,0 +1,210 @@
+# The Android checks of one commit of the private Mom-s-Food/goodfood-main repository (A1 plan,
+# goodfood-main docs/plans/2026-11-03-a1-android-foundation.md, decision 17). A workflow of its own,
+# so the Rust jobs of farm-ci.yml are untouched: it listens to the same trigger-ci dispatch and
+# reports `farm/android` on the private commit. Like farm-ci, it holds no application source and
+# never persists the credential in check mode.
+#
+# task=check (default, and every trigger-ci): module graph, ktlint (Spotless), detekt, Android Lint,
+#   unit tests (T1, and T2 on Room over real SQLite), Roborazzi screenshot verification with the
+#   Accessibility Test Framework checks, exported Room schemas committed, and the size budget.
+#   On a dispatch from goodfood-main it runs only when the commit changes android/, contracts/,
+#   design/tokens/ or tests/fixtures/sync/ (or this workflow is dispatched by hand).
+# task=record (by hand, a branch, never main): spotlessApply, the Room schema export and the
+#   Roborazzi baselines, recorded on this Linux runner, pushed to the branch as one commit that
+#   may change only android/.
+#
+# Logs are public: test data is synthetic and nothing prints a secret.
+name: farm-android
+
+on:
+  repository_dispatch:
+    types: [trigger-ci]
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'check: full commit SHA of Mom-s-Food/goodfood-main; empty checks main'
+        required: false
+        default: ''
+      task:
+        description: 'check, or record (format, schemas, screenshot baselines) onto a branch'
+        required: false
+        default: check
+        type: choice
+        options: [check, record]
+      branch:
+        description: 'record: the branch of goodfood-main to commit to (never main)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: farm-android-${{ inputs.task || 'check' }}-${{ github.event.client_payload.source_ref || inputs.source_ref || inputs.branch || 'main' }}
+  cancel-in-progress: true
+
+env:
+  PRIVATE_REPO: Mom-s-Food/goodfood-main
+  STATUS_CONTEXT: farm/android
+  TASK: ${{ inputs.task || 'check' }}
+  GRADLE_OPTS: -Dorg.gradle.daemon=false
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - name: Validate the request
+        env:
+          REQUESTED: ${{ github.event.client_payload.source_ref || inputs.source_ref }}
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          if [ -n "$REQUESTED" ] && ! printf '%s' "$REQUESTED" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::source_ref must be a full lowercase commit SHA"; exit 1
+          fi
+          if [ "$TASK" = record ]; then
+            printf '%s' "$BRANCH" | grep -Eq '^[A-Za-z0-9._/-]{1,100}$' || { echo "::error::record needs a branch"; exit 1; }
+            case $BRANCH in main | refs/* | */main) echo "::error::refusing to write to $BRANCH"; exit 1 ;; esac
+          fi
+      - name: Check out the private source (check)
+        if: ${{ env.TASK == 'check' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ github.event.client_payload.source_ref || inputs.source_ref || 'main' }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Check out the branch to record onto (record)
+        if: ${{ env.TASK == 'record' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ inputs.branch }}
+      - name: Pin the commit and decide whether Android is touched
+        id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"; echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          if [ ! -f android/settings.gradle.kts ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"; echo "no android/ at $sha"; exit 0
+          fi
+          if [ "$TASK" = record ] || [ "$EVENT" = workflow_dispatch ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if git merge-base --is-ancestor HEAD origin/main; then
+            base="$(git rev-parse -q --verify 'HEAD^1' || git rev-parse HEAD)"
+          else
+            base="$(git merge-base HEAD origin/main)"
+          fi
+          if git diff --name-only "$base" HEAD | grep -Eq '^(android/|contracts/|design/tokens/|tests/fixtures/sync/)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"; echo "no Android change since $base"
+          fi
+      - name: Mark the private commit pending
+        if: ${{ env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
+          SHA: ${{ steps.gate.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api "repos/$PRIVATE_REPO/statuses/$SHA" -X POST -f state=pending -f context="$STATUS_CONTEXT" \
+            -f target_url="$RUN_URL" -f description="Android checks running" > /dev/null
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        with:
+          # Only main saves the Gradle cache, so branches never churn the repository cache.
+          cache-read-only: ${{ github.event_name == 'repository_dispatch' && 'false' || 'true' }}
+          add-job-summary: on-failure
+      - name: Static checks (module graph, ktlint, detekt, Lint)
+        id: static
+        if: ${{ env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
+        working-directory: android
+        run: ./gradlew --continue checkModuleGraph ciFormat detektAll ciLint
+      - name: Unit, Room and screenshot tests (T1, T2, T6)
+        id: tests
+        if: ${{ !cancelled() && env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
+        working-directory: android
+        run: ./gradlew --continue ciUnitTest ciScreenshots
+      - name: Exported Room schemas and screenshots are committed
+        if: ${{ !cancelled() && env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
+        run: |
+          set -euo pipefail
+          changed="$(git status --porcelain --untracked-files=all -- 'android/*/schemas' 'android/*/*/schemas' | cut -c4-)"
+          if [ -n "$changed" ]; then
+            printf '%s\n' "$changed"
+            echo "::error::the build changed exported Room schemas; run farm-android with task=record on the branch"; exit 1
+          fi
+      - name: Size budget (download per device)
+        if: ${{ !cancelled() && env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
+        run: bash android/scripts/size-check.sh
+      - name: Keep the reports
+        if: ${{ failure() && steps.gate.outputs.run == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android-reports-${{ github.run_id }}
+          path: |
+            android/**/build/reports/
+            android/**/build/test-results/
+            android/**/build/outputs/roborazzi/
+            android/build/reports/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      # record
+      - name: Format, export schemas, record screenshot baselines
+        if: ${{ env.TASK == 'record' && steps.gate.outputs.run == 'true' }}
+        working-directory: android
+        run: |
+          ./gradlew --continue spotlessApply
+          ./gradlew --continue ciRecordScreenshots
+      - name: Commit and push the recorded files to the branch
+        if: ${{ env.TASK == 'record' && steps.gate.outputs.run == 'true' }}
+        env:
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          if [ -z "$(git status --porcelain)" ]; then echo "nothing changed"; exit 0; fi
+          git status --short
+          stray=$(git status --porcelain --untracked-files=all | cut -c4- | grep -Ev '^android/' || true)
+          if [ -n "$stray" ]; then
+            printf '%s\n' "$stray"; echo "::error::record changed files outside android/; nothing pushed"; exit 1
+          fi
+          git config user.name "goodfood-build-farm"
+          git config user.email "goodfood-build-farm@users.noreply.github.com"
+          git add -A android
+          git commit -q -m "chore(farm): android record (format, Room schemas, screenshot baselines)" \
+            -m "Generated by goodfood-build-farm farm-android.yml run ${{ github.run_id }}."
+          for _ in 1 2 3; do
+            git push origin "HEAD:$BRANCH" && exit 0
+            git pull --rebase origin "$BRANCH"
+          done
+          echo "::error::could not push to $BRANCH"; exit 1
+
+      - name: Report the result to the private commit
+        if: ${{ always() && env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
+          SHA: ${{ steps.gate.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          JOB: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          case $JOB in
+            success) state=success; desc="Android checks passed" ;;
+            cancelled) state=error; desc="cancelled; re-dispatch farm-android" ;;
+            *) state=failure; desc="Android checks failed" ;;
+          esac
+          gh api "repos/$PRIVATE_REPO/statuses/$SHA" -X POST -f state="$state" -f context="$STATUS_CONTEXT" \
+            -f target_url="$RUN_URL" -f description="$desc" > /dev/null
+          echo "### $STATUS_CONTEXT: $state" >> "$GITHUB_STEP_SUMMARY"

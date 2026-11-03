@@ -1,5 +1,5 @@
 {
-  "_doc": "The farm's job budget. The org is on GitHub Free: about 20 concurrent jobs on standard runners for the whole org, shared by every workflow here. farm-ci (9 jobs a run, 6 at once after setup) must always find room, so every background workflow runs one at a time through a fixed concurrency group and caps its matrices, and their peaks together stay within org_concurrent_jobs - ci_reserve. scripts/check-farm-workflows.py enforces this file on every push (farm-lint.yml).",
+  "_doc": "The farm's job budget. The org is on GitHub Free: about 20 concurrent jobs on standard runners for the whole org, shared by every workflow here. farm-ci (9 jobs a run, 6 at once after setup) and farm-android (1 job, only for commits that touch Android) must always find room, so every background workflow runs one at a time through a fixed concurrency group and caps its matrices, and their peaks together stay within org_concurrent_jobs - ci_reserve. scripts/check-farm-workflows.py enforces this file on every push (farm-lint.yml).",
   "org_concurrent_jobs": 20,
   "ci_reserve": 7,
   "max_parallel_cap": 4,
@@ -8,17 +8,38 @@
     "farm-ci": "dispatched per commit by agents and goodfood-main; one group per commit, 6 jobs at once",
     "farm-build": "one run at a time (group farm-build); images matrix capped",
     "farm-task": "one run per branch (group farm-task-<branch>), a single job that pushes to that branch",
-    "farm-lint": "this check, on pushes to the farm"
+    "farm-lint": "this check, on pushes to the farm",
+    "farm-android": "dispatched with farm-ci (the same trigger-ci) and by hand; one job per commit, only when the commit changes Android paths"
   },
   "background": {
-    "farm-fuzz": {"group": "farm-fuzz"},
-    "farm-perf": {"group": "farm-perf"},
-    "farm-replay": {"group": "farm-replay-${{ inputs.mode || 'replay' }}", "groups": 2},
-    "farm-synthetic": {"group": "farm-synthetic"},
-    "farm-load": {"group": "farm-load"},
-    "farm-evals": {"group": "farm-evals"},
-    "farm-zap": {"group": "farm-zap"},
-    "farm-staging-nightly": {"group": "farm-staging-nightly"},
-    "farm-probe": {"group": "farm-probe", "_doc": "holds its 1 job all the time: a chain of ~5 h 40 min runs, each dispatching the next"}
+    "farm-fuzz": {
+      "group": "farm-fuzz"
+    },
+    "farm-perf": {
+      "group": "farm-perf"
+    },
+    "farm-replay": {
+      "group": "farm-replay-${{ inputs.mode || 'replay' }}",
+      "groups": 2
+    },
+    "farm-synthetic": {
+      "group": "farm-synthetic"
+    },
+    "farm-load": {
+      "group": "farm-load"
+    },
+    "farm-evals": {
+      "group": "farm-evals"
+    },
+    "farm-zap": {
+      "group": "farm-zap"
+    },
+    "farm-staging-nightly": {
+      "group": "farm-staging-nightly"
+    },
+    "farm-probe": {
+      "group": "farm-probe",
+      "_doc": "holds its 1 job all the time: a chain of ~5 h 40 min runs, each dispatching the next"
+    }
   }
 }
