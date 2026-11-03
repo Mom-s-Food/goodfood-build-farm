@@ -50,8 +50,9 @@ env:
   PRIVATE_REPO: Mom-s-Food/goodfood-main
   STATUS_CONTEXT: farm/ios
   TASK: ${{ inputs.task || 'check' }}
-  # ios/scripts/ci.sh puts the pinned tools and Swift packages here.
-  GOODFOOD_IOS_TOOLS: ${{ github.workspace }}/../ios-tools
+  # ios/scripts/ci.sh puts the pinned tools, Swift packages and reports here (gitignored in
+  # goodfood-main; inside the workspace because upload-artifact refuses paths with "..").
+  GOODFOOD_IOS_TOOLS: ${{ github.workspace }}/.ios-tools
   NSUnbufferedIO: "YES"
 
 jobs:
