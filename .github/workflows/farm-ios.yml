@@ -55,9 +55,14 @@ env:
   NSUnbufferedIO: "YES"
 
 jobs:
-  ios:
-    runs-on: macos-26
-    timeout-minutes: 90
+  # A small Linux job decides; the macOS job starts only for a commit that changes iOS paths, so a
+  # backend-only trigger-ci never takes one of the org's few macOS runners.
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.gate.outputs.sha }}
+      run: ${{ steps.gate.outputs.run }}
     steps:
       - name: Validate the request
         env:
@@ -72,22 +77,14 @@ jobs:
             printf '%s' "$BRANCH" | grep -Eq '^[A-Za-z0-9._/-]{1,100}$' || { echo "::error::record needs a branch"; exit 1; }
             case $BRANCH in main | refs/* | */main) echo "::error::refusing to write to $BRANCH"; exit 1 ;; esac
           fi
-      - name: Check out the private source (check)
-        if: ${{ env.TASK == 'check' }}
+      - name: Check out the private source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ secrets.PRIVATE_REPO_PAT }}
-          ref: ${{ github.event.client_payload.source_ref || inputs.source_ref || 'main' }}
+          ref: ${{ env.TASK == 'record' && inputs.branch || github.event.client_payload.source_ref || inputs.source_ref || 'main' }}
           persist-credentials: false
           fetch-depth: 0
-      - name: Check out the branch to record onto (record)
-        if: ${{ env.TASK == 'record' }}
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: ${{ env.PRIVATE_REPO }}
-          token: ${{ secrets.PRIVATE_REPO_PAT }}
-          ref: ${{ inputs.branch }}
       - name: Pin the commit and decide whether iOS is touched
         id: gate
         env:
@@ -106,8 +103,7 @@ jobs:
           else
             base="$(git merge-base HEAD origin/main)"
           fi
-          if git diff --name-only "$base" HEAD \
-            | grep -Eq '^(ios/|contracts/(openapi|analytics|fixtures)/|design/tokens/|tests/fixtures/sync/|tests/mobile-e2e/(ios|shared)/)'; then
+          if git diff --name-only "$base" HEAD             | grep -Eq '^(ios/|contracts/(openapi|analytics|fixtures)/|design/tokens/|tests/fixtures/sync/|tests/mobile-e2e/(ios|shared)/)'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"; echo "no iOS change since $base"
@@ -119,40 +115,61 @@ jobs:
           SHA: ${{ steps.gate.outputs.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          gh api "repos/$PRIVATE_REPO/statuses/$SHA" -X POST -f state=pending -f context="$STATUS_CONTEXT" \
-            -f target_url="$RUN_URL" -f description="iOS checks running" > /dev/null
+          gh api "repos/$PRIVATE_REPO/statuses/$SHA" -X POST -f state=pending -f context="$STATUS_CONTEXT"             -f target_url="$RUN_URL" -f description="iOS checks running" > /dev/null
+
+  ios:
+    needs: gate
+    if: ${{ needs.gate.outputs.run == 'true' }}
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Check out the pinned private source (check)
+        if: ${{ env.TASK == 'check' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+      - name: Check out the branch to record onto (record)
+        if: ${{ env.TASK == 'record' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ inputs.branch }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        if: ${{ steps.gate.outputs.run == 'true' }}
+        if: ${{ !cancelled() }}
         with:
           node-version: 22
       - name: Restore the Swift package checkouts
-        if: ${{ steps.gate.outputs.run == 'true' }}
+        if: ${{ !cancelled() }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.GOODFOOD_IOS_TOOLS }}/spm
           key: farm-ios-spm-${{ hashFiles('ios/Packages/GoodFoodKit/Package.resolved', 'ios/.xcode-version') }}
           restore-keys: farm-ios-spm-
       - name: Xcode and pinned tools (XcodeGen, SwiftLint, Maestro)
-        if: ${{ steps.gate.outputs.run == 'true' }}
+        if: ${{ !cancelled() }}
         run: ios/scripts/ci.sh tools
       - name: Lint (swift-format, SwiftLint)
         id: lint
-        if: ${{ env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
+        if: ${{ env.TASK == 'check' }}
         run: ios/scripts/ci.sh lint
       - name: Build (XcodeGen project, Package.resolved, simulator build)
         id: build
-        if: ${{ !cancelled() && env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
+        if: ${{ !cancelled() && env.TASK == 'check' }}
         run: ios/scripts/ci.sh build
       - name: Tests (Swift Testing T1 and T2, snapshots T6)
         id: tests
-        if: ${{ !cancelled() && env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
+        if: ${{ !cancelled() && env.TASK == 'check' }}
         run: ios/scripts/ci.sh test
       - name: Journeys on the mock server (Maestro, T7)
         id: journeys
-        if: ${{ !cancelled() && env.TASK == 'check' && steps.gate.outputs.run == 'true' && steps.build.outcome == 'success' }}
+        if: ${{ !cancelled() && env.TASK == 'check' && steps.build.outcome == 'success' }}
         run: ios/scripts/ci.sh journeys
       - name: Keep the reports
-        if: ${{ failure() && steps.gate.outputs.run == 'true' }}
+        if: ${{ failure() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ios-reports-${{ github.run_id }}
@@ -162,13 +179,13 @@ jobs:
 
       # record
       - name: Format, resolve packages, record snapshot baselines
-        if: ${{ env.TASK == 'record' && steps.gate.outputs.run == 'true' }}
+        if: ${{ env.TASK == 'record' }}
         run: |
           ios/scripts/ci.sh format
           ios/scripts/ci.sh resolve
           ios/scripts/ci.sh record-snapshots
       - name: Commit and push the recorded files to the branch
-        if: ${{ !cancelled() && env.TASK == 'record' && steps.gate.outputs.run == 'true' }}
+        if: ${{ !cancelled() && env.TASK == 'record' }}
         env:
           BRANCH: ${{ inputs.branch }}
         run: |
@@ -191,10 +208,10 @@ jobs:
           echo "::error::could not push to $BRANCH"; exit 1
 
       - name: Report the result to the private commit
-        if: ${{ always() && env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
+        if: ${{ always() && env.TASK == 'check' }}
         env:
           GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
-          SHA: ${{ steps.gate.outputs.sha }}
+          SHA: ${{ needs.gate.outputs.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           JOB: ${{ job.status }}
           LINT: ${{ steps.lint.outcome }}
