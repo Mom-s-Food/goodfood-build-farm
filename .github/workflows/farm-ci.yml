@@ -523,6 +523,11 @@ jobs:
       - name: Migrations that already landed are never renamed, edited or deleted
         if: ${{ !cancelled() && hashFiles('scripts/ci/check-migrations-immutable.py') != '' }}
         run: python3 -I scripts/ci/check-migrations-immutable.py --base "${{ steps.base.outputs.base }}"
+      # Billing refuses a different document under a version it stored, and the api and worker
+      # crash-loop (staging, 2026-11-03). Skipped on commits from before the check existed.
+      - name: A changed billing document has a new version
+        if: ${{ !cancelled() && hashFiles('scripts/ci/check-billing-version.py') != '' }}
+        run: python -I scripts/ci/check-billing-version.py --base "${{ steps.base.outputs.base }}"
       - name: Black-box journeys compile (tests/, go vet and go build; nothing runs against a server)
         if: ${{ !cancelled() }}
         working-directory: tests
