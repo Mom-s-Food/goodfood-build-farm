@@ -1,0 +1,213 @@
+# The iOS checks of one commit of the private Mom-s-Food/goodfood-main repository (I1 plan,
+# goodfood-main docs/plans/2026-11-03-i1-ios-foundation.md, decision 5). A workflow of its own, as
+# farm-android.yml, so the Rust jobs of farm-ci.yml are untouched: it listens to the same
+# trigger-ci dispatch and reports `farm/ios` on the private commit. It holds no application
+# source and never persists the credential in check mode. One macOS job per commit (the org has
+# at most 5 macOS jobs at once), and only for commits that change iOS paths.
+#
+# task=check (default, and every trigger-ci): ios/scripts/ci.sh tools, lint (swift-format,
+#   SwiftLint), build (XcodeGen project, Package.resolved pins, unsigned simulator build), test
+#   (Swift Testing and snapshots on the pinned simulator) and journeys (Maestro on the simulator
+#   against the contract mock server). On a dispatch from goodfood-main it runs only when the
+#   commit changes ios/, contracts/openapi/, contracts/analytics/, contracts/fixtures/,
+#   design/tokens/, tests/fixtures/sync/ or tests/mobile-e2e/{ios,shared}/ (always when
+#   dispatched by hand).
+# task=record (by hand, a branch, never main): swift-format, Package.resolved and the snapshot
+#   baselines, made on this runner (same Xcode and simulator as check), pushed to the branch as
+#   one commit that may change only ios/.
+#
+# Logs are public: test data is synthetic and nothing prints a secret.
+name: farm-ios
+
+on:
+  repository_dispatch:
+    types: [trigger-ci]
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'check: full commit SHA of Mom-s-Food/goodfood-main; empty checks main'
+        required: false
+        default: ''
+      task:
+        description: 'check, or record (format, Package.resolved, snapshot baselines) onto a branch'
+        required: false
+        default: check
+        type: choice
+        options: [check, record]
+      branch:
+        description: 'record: the branch of goodfood-main to commit to (never main)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: farm-ios-${{ inputs.task || 'check' }}-${{ github.event.client_payload.source_ref || inputs.source_ref || inputs.branch || 'main' }}
+  cancel-in-progress: true
+
+env:
+  PRIVATE_REPO: Mom-s-Food/goodfood-main
+  STATUS_CONTEXT: farm/ios
+  TASK: ${{ inputs.task || 'check' }}
+  # ios/scripts/ci.sh puts the pinned tools and Swift packages here.
+  GOODFOOD_IOS_TOOLS: ${{ github.workspace }}/../ios-tools
+  NSUnbufferedIO: "YES"
+
+jobs:
+  ios:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Validate the request
+        env:
+          REQUESTED: ${{ github.event.client_payload.source_ref || inputs.source_ref }}
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          if [ -n "$REQUESTED" ] && ! printf '%s' "$REQUESTED" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::source_ref must be a full lowercase commit SHA"; exit 1
+          fi
+          if [ "$TASK" = record ]; then
+            printf '%s' "$BRANCH" | grep -Eq '^[A-Za-z0-9._/-]{1,100}$' || { echo "::error::record needs a branch"; exit 1; }
+            case $BRANCH in main | refs/* | */main) echo "::error::refusing to write to $BRANCH"; exit 1 ;; esac
+          fi
+      - name: Check out the private source (check)
+        if: ${{ env.TASK == 'check' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ github.event.client_payload.source_ref || inputs.source_ref || 'main' }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Check out the branch to record onto (record)
+        if: ${{ env.TASK == 'record' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ inputs.branch }}
+      - name: Pin the commit and decide whether iOS is touched
+        id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"; echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          if [ ! -f ios/project.yml ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"; echo "no ios/ at $sha"; exit 0
+          fi
+          if [ "$TASK" = record ] || [ "$EVENT" = workflow_dispatch ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if git merge-base --is-ancestor HEAD origin/main; then
+            base="$(git rev-parse -q --verify 'HEAD^1' || git rev-parse HEAD)"
+          else
+            base="$(git merge-base HEAD origin/main)"
+          fi
+          if git diff --name-only "$base" HEAD \
+            | grep -Eq '^(ios/|contracts/(openapi|analytics|fixtures)/|design/tokens/|tests/fixtures/sync/|tests/mobile-e2e/(ios|shared)/)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"; echo "no iOS change since $base"
+          fi
+      - name: Mark the private commit pending
+        if: ${{ env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
+          SHA: ${{ steps.gate.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api "repos/$PRIVATE_REPO/statuses/$SHA" -X POST -f state=pending -f context="$STATUS_CONTEXT" \
+            -f target_url="$RUN_URL" -f description="iOS checks running" > /dev/null
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        with:
+          node-version: 22
+      - name: Restore the Swift package checkouts
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.GOODFOOD_IOS_TOOLS }}/spm
+          key: farm-ios-spm-${{ hashFiles('ios/Packages/GoodFoodKit/Package.resolved', 'ios/.xcode-version') }}
+          restore-keys: farm-ios-spm-
+      - name: Xcode and pinned tools (XcodeGen, SwiftLint, Maestro)
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        run: ios/scripts/ci.sh tools
+      - name: Lint (swift-format, SwiftLint)
+        id: lint
+        if: ${{ env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
+        run: ios/scripts/ci.sh lint
+      - name: Build (XcodeGen project, Package.resolved, simulator build)
+        id: build
+        if: ${{ !cancelled() && env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
+        run: ios/scripts/ci.sh build
+      - name: Tests (Swift Testing T1 and T2, snapshots T6)
+        id: tests
+        if: ${{ !cancelled() && env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
+        run: ios/scripts/ci.sh test
+      - name: Journeys on the mock server (Maestro, T7)
+        id: journeys
+        if: ${{ !cancelled() && env.TASK == 'check' && steps.gate.outputs.run == 'true' && steps.build.outcome == 'success' }}
+        run: ios/scripts/ci.sh journeys
+      - name: Keep the reports
+        if: ${{ failure() && steps.gate.outputs.run == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ios-reports-${{ github.run_id }}
+          path: ${{ env.GOODFOOD_IOS_TOOLS }}/reports/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      # record
+      - name: Format, resolve packages, record snapshot baselines
+        if: ${{ env.TASK == 'record' && steps.gate.outputs.run == 'true' }}
+        run: |
+          ios/scripts/ci.sh format
+          ios/scripts/ci.sh resolve
+          ios/scripts/ci.sh record-snapshots
+      - name: Commit and push the recorded files to the branch
+        if: ${{ !cancelled() && env.TASK == 'record' && steps.gate.outputs.run == 'true' }}
+        env:
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          if [ -z "$(git status --porcelain)" ]; then echo "nothing changed"; exit 0; fi
+          git status --short
+          stray=$(git status --porcelain --untracked-files=all | cut -c4- | grep -Ev '^ios/' || true)
+          if [ -n "$stray" ]; then
+            printf '%s\n' "$stray"; echo "::error::record changed files outside ios/; nothing pushed"; exit 1
+          fi
+          git config user.name "goodfood-build-farm"
+          git config user.email "goodfood-build-farm@users.noreply.github.com"
+          git add -A ios
+          git commit -q -m "chore(farm): ios record (format, Package.resolved, snapshot baselines)" \
+            -m "Generated by goodfood-build-farm farm-ios.yml run ${{ github.run_id }}."
+          for _ in 1 2 3; do
+            git push origin "HEAD:$BRANCH" && exit 0
+            git pull --rebase origin "$BRANCH"
+          done
+          echo "::error::could not push to $BRANCH"; exit 1
+
+      - name: Report the result to the private commit
+        if: ${{ always() && env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
+          SHA: ${{ steps.gate.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          JOB: ${{ job.status }}
+          LINT: ${{ steps.lint.outcome }}
+          BUILD: ${{ steps.build.outcome }}
+          TESTS: ${{ steps.tests.outcome }}
+          JOURNEYS: ${{ steps.journeys.outcome }}
+        run: |
+          set -euo pipefail
+          case $JOB in
+            success) state=success; desc="iOS checks passed" ;;
+            cancelled) state=error; desc="cancelled; re-dispatch farm-ios" ;;
+            *) state=failure; desc="lint=$LINT build=$BUILD tests=$TESTS journeys=$JOURNEYS" ;;
+          esac
+          gh api "repos/$PRIVATE_REPO/statuses/$SHA" -X POST -f state="$state" -f context="$STATUS_CONTEXT" \
+            -f target_url="$RUN_URL" -f description="$desc" > /dev/null
+          { echo "### $STATUS_CONTEXT: $state"; echo "$desc"; } >> "$GITHUB_STEP_SUMMARY"
