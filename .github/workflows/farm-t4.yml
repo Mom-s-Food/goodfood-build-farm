@@ -1,0 +1,256 @@
+# Lane T4 (TESTING_STRATEGY §1): the black-box API journeys of the private
+# Mom-s-Food/goodfood-main repository (tests/api-e2e) against the local stack on a public
+# runner. The stack is the one infra/compose/dev.yml describes, started without images:
+# PostgreSQL 18 on tmpfs, then the api, worker and migrate binaries built here (dev profile)
+# and started by the private scripts/test/t4-stack.sh with the compose file's settings:
+# AI_MODE=simulated on the journeys' recordings, the fixture food catalog, local object
+# storage, sign-in codes on GET /local/signin-code, and the MCP connector mounted.
+#
+# It is its own workflow so farm-ci's time does not grow. Triggers:
+#   repository_dispatch trigger-t4  the private farm-dispatch sends it for a push to main that
+#                                   touches the backend, the contracts or the journeys (a path filter)
+#   workflow_dispatch               any commit, with an optional go test -run pattern
+#   push to a farm branch t4/**     runs main's journeys (a new copy of this file is registered
+#                                   for workflow_dispatch on that branch by its first run)
+#
+# Results: go test -json (results.json), every criterion a journey declared with the result
+# of the test that logged it (criteria.tsv), and req-coverage.py --results over that run
+# (coverage.json, the phase 1 T4 gaps that only passing journeys leave) in the t4-<run> artifact
+# and the run summary; the farm/t4 status on the private commit.
+#
+# Logs and artifacts of a public repository are public. No secret reaches this workflow
+# beyond PRIVATE_REPO_PAT for the checkout and the status; the stack's database password and
+# email key are the compose file's local-only placeholders, the users are synthetic, and
+# nothing talks to a model (simulated mode serves recordings).
+name: farm-t4
+
+on:
+  repository_dispatch:
+    types: [trigger-t4]
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Full commit SHA of Mom-s-Food/goodfood-main; empty checks main'
+        required: false
+        default: ''
+      run:
+        description: 'Optional go test -run pattern; empty runs every journey'
+        required: false
+        default: ''
+  push:
+    branches: ['t4/**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: farm-t4-${{ github.event.client_payload.source_ref || inputs.source_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PRIVATE_REPO: Mom-s-Food/goodfood-main
+  STATUS_CONTEXT: farm/t4
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: never
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+jobs:
+  journeys:
+    name: T4 journeys on the local stack
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - name: Validate the request
+        env:
+          REQUESTED: ${{ github.event.client_payload.source_ref || inputs.source_ref }}
+          RUN: ${{ inputs.run }}
+        run: |
+          set -euo pipefail
+          if [ -n "$REQUESTED" ] && ! printf '%s' "$REQUESTED" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::source_ref must be a full lowercase commit SHA"; exit 1
+          fi
+          [ -z "$RUN" ] || printf '%s' "$RUN" | grep -Eq '^[A-Za-z0-9_|^$/.()-]{1,200}$' || { echo "::error::run must be a go test -run pattern"; exit 1; }
+      # A throwaway server: data on tmpfs, no fsync. Same image as farm-ci and the compose file.
+      - name: Start PostgreSQL 18 (tmpfs, fsync off)
+        run: |
+          docker run -d --name pg -p 5432:5432 \
+            -e POSTGRES_DB=goodfood -e POSTGRES_USER=goodfood -e POSTGRES_PASSWORD=goodfood \
+            --tmpfs /var/lib/postgresql:rw,size=4g \
+            postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873 \
+            -c fsync=off -c synchronous_commit=off -c full_page_writes=off -c max_connections=200 > /dev/null
+      - name: Check out the private source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ github.event.client_payload.source_ref || inputs.source_ref || 'main' }}
+          persist-credentials: false
+      - name: Pin the exact commit
+        id: pin
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "source_ref=$sha" >> "$GITHUB_OUTPUT"
+          echo "source $sha"
+      - name: Mark the private commit pending
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
+          SHA: ${{ steps.pin.outputs.source_ref }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api "repos/$PRIVATE_REPO/statuses/$SHA" -X POST -f state=pending -f context="$STATUS_CONTEXT" \
+            -f target_url="$RUN_URL" -f description="T4 journeys running" > /dev/null || echo "::warning::could not post $STATUS_CONTEXT"
+      - name: Rust toolchain (stable)
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      # One entry per Cargo.lock and toolchain (rust-cache does not save a key that exists), so
+      # branch runs may save it without churning the repository cache.
+      - name: Restore the dependency cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: backend
+          shared-key: farm-t4
+          cache-bin: "false"
+      - name: Build the api, worker and migrate binaries
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          cargo build --locked -p goodfood-api -p goodfood-worker -p goodfood-migrate
+          mkdir -p "$RUNNER_TEMP/bin"
+          for b in api worker migrate; do install -m 0755 "target/debug/$b" "$RUNNER_TEMP/bin/$b"; done
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: tests/go.mod
+          cache: false
+      - name: Wait for PostgreSQL
+        run: |
+          for _ in $(seq 1 60); do
+            docker exec pg pg_isready -U goodfood -d goodfood -h 127.0.0.1 > /dev/null 2>&1 && exit 0
+            sleep 1
+          done
+          docker logs pg; exit 1
+      - name: Start the stack
+        run: scripts/test/t4-stack.sh --bin "$RUNNER_TEMP/bin" --state "$RUNNER_TEMP/stack"
+      - name: T4 journeys
+        id: t4
+        working-directory: tests
+        env:
+          BASE_URL: http://localhost:8080
+          RUN: ${{ inputs.run }}
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/t4"; mkdir -p "$out"
+          args=(-count=1 -json -timeout 40m)
+          [ -z "$RUN" ] || args+=(-run "$RUN")
+          go test "${args[@]}" ./api-e2e/... > "$out/results.json"
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          jq -r 'select(.Test != null and (.Action == "pass" or .Action == "fail" or .Action == "skip"))
+                 | "\(.Action)\t\(.Test)\t\(.Elapsed // 0)s"' "$out/results.json" > "$out/tests.tsv" || true
+          pass=$(grep -c '^pass' "$out/tests.tsv" || true)
+          skip=$(grep -c '^skip' "$out/tests.tsv" || true)
+          fail=$(grep -c '^fail' "$out/tests.tsv" || true)
+          echo "summary=passed $pass, skipped $skip, failed $fail" >> "$GITHUB_OUTPUT"
+          if [ $((pass + skip + fail)) -eq 0 ] && [ "$code" -eq 0 ]; then
+            echo "::error::no journey ran (run pattern '${RUN:-<all>}' matched no test)"
+            code=1; echo "code=$code" >> "$GITHUB_OUTPUT"
+          fi
+          {
+            echo "### farm-t4: exit $code"
+            echo
+            echo "Source \`$(git rev-parse HEAD)\`. Passed $pass, skipped $skip, failed $fail (tests and subtests)."
+            echo
+            echo '| Result | Test | Time |'
+            echo '| --- | --- | --- |'
+            sed 's/\t/ | /g; s/^/| /; s/$/ |/' "$out/tests.tsv"
+          } >> "$GITHUB_STEP_SUMMARY"
+          grep -v '^pass' "$out/tests.tsv" || true
+          if [ "$fail" -gt 0 ] || [ "$code" -ne 0 ]; then
+            awk -F'\t' '$1 == "fail" {print $2}' "$out/tests.tsv" | while IFS= read -r t; do
+              echo "::group::$t"
+              jq -r --arg t "$t" 'select(.Test == $t and .Action == "output") | .Output' "$out/results.json"
+              echo "::endgroup::"
+            done
+          fi
+          # Skipped journeys say why; a skip proves nothing.
+          awk -F'\t' '$1 == "skip" {print $2}' "$out/tests.tsv" | while IFS= read -r t; do
+            jq -r --arg t "$t" 'select(.Test == $t and .Action == "output") | .Output' "$out/results.json" | grep -m1 -E '\.go:[0-9]+:' | sed "s|^|skip $t: |" || true
+          done
+      - name: Criteria the run proved
+        if: ${{ !cancelled() && steps.t4.outcome != 'skipped' }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/t4"
+          # criteria.tsv: criterion, result of the (sub)test that logged COVERS, test.
+          python3 -I - "$out/results.json" > "$out/criteria.tsv" <<'PY'
+          import json, re, sys
+          logged, final = {}, {}
+          for line in open(sys.argv[1], encoding="utf-8"):
+              try:
+                  ev = json.loads(line)
+              except ValueError:
+                  continue
+              t = ev.get("Test")
+              if not t:
+                  continue
+              if ev.get("Action") == "output":
+                  for m in re.finditer(r"\bCOVERS ([A-Z]{2,6}-\d{1,3}(?:\.\d{1,3})?)\b", ev.get("Output") or ""):
+                      logged.setdefault(t, set()).add(m.group(1))
+              elif ev.get("Action") in ("pass", "fail", "skip"):
+                  final[t] = ev["Action"]
+          rows = sorted((c, final.get(t, "unfinished"), t) for t, cs in logged.items() for c in cs)
+          for r in rows:
+              print("\t".join(r))
+          PY
+          passed=$(awk -F'\t' '$2 == "pass" {print $1}' "$out/criteria.tsv" | sort -u | wc -l)
+          other=$(awk -F'\t' '$2 != "pass" {print $1}' "$out/criteria.tsv" | sort -u | wc -l)
+          rc=0
+          python3 -I scripts/test/req-coverage.py --release MVP --phase 1 --format json --results "$out/results.json" > "$out/coverage.json" 2>/dev/null || rc=$?
+          [ "$rc" -le 1 ] || { echo "::error::req-coverage.py exited $rc"; exit 1; }
+          t4gaps=$(jq '[.criteria[] | select(.missing | index("T4"))] | length' "$out/coverage.json")
+          jq -r '[.criteria[] | select(.missing | index("T4")) | .criterion] | join(", ")' "$out/coverage.json" > "$out/t4-gaps.txt"
+          {
+            echo
+            echo "### Criteria"
+            echo
+            echo "Declared by journeys that passed: $passed criteria; declared only by journeys that skipped or failed: $other (criteria.tsv)."
+            echo "Release MVP, phase 1, counting only this run's passing journeys: **$t4gaps criteria miss T4**."
+            echo
+            echo "<details><summary>T4 gaps</summary>"
+            echo
+            cat "$out/t4-gaps.txt"
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "T4 gaps (phase 1, passing journeys only): $t4gaps"
+          cat "$out/t4-gaps.txt"
+      - name: Stack logs of a failed run
+        if: ${{ failure() }}
+        run: |
+          for f in api worker; do
+            echo "::group::$f (last 200 lines)"; tail -200 "$RUNNER_TEMP/stack/$f.log" 2>/dev/null || true; echo "::endgroup::"
+          done
+      - name: Keep the results
+        if: ${{ !cancelled() && steps.t4.outcome != 'skipped' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: t4-${{ github.run_id }}
+          path: ${{ runner.temp }}/t4/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Fail when a journey failed
+        if: ${{ !cancelled() && steps.t4.outputs.code != '0' }}
+        env:
+          CODE: ${{ steps.t4.outputs.code }}
+        run: |
+          echo "::error::go test exited $CODE; see the failed tests' output above and the t4 artifact"
+          exit 1
+      - name: Report farm/t4 on the private commit
+        if: ${{ always() && steps.pin.outputs.source_ref != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
+          SHA: ${{ steps.pin.outputs.source_ref }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          OUTCOME: ${{ job.status }}
+          SUMMARY: ${{ steps.t4.outputs.summary }}
+        run: |
+          case "$OUTCOME" in success) state=success ;; cancelled) state=error ;; *) state=failure ;; esac
+          gh api "repos/$PRIVATE_REPO/statuses/$SHA" -X POST -f state="$state" -f context="$STATUS_CONTEXT" \
+            -f target_url="$RUN_URL" -f description="T4 ${SUMMARY:-did not run}" > /dev/null || echo "::warning::could not post $STATUS_CONTEXT"
