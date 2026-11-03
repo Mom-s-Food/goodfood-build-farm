@@ -18,6 +18,11 @@
 # Production is never scanned: the script refuses --env production and any server whose
 # /v1/config reports another environment. A schedule runs only this repository's own workflow
 # on the private main, never code from a fork.
+# After the scan, the same job runs the Go attack tests of tests/security/ against staging
+# (go -C tests test -count=1 ./security/...). Those that need a signed-in user sign up their own
+# synthetic users with QA_SIGNIN_KEY, which reaches only that step; the tests never print a token,
+# a code or a key, and skip on any server that reports environment production. They run even when
+# the scan failed, so one never hides the other.
 name: farm-zap
 
 on:
@@ -78,6 +83,12 @@ jobs:
           token: ${{ secrets.PRIVATE_REPO_PAT }}
           ref: ${{ inputs.source_ref || 'main' }}
           persist-credentials: false
+      - name: Set up Go
+        if: steps.key.outputs.ready == 'true'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: tests/go.mod
+          cache: false
       - name: Install age
         if: steps.key.outputs.ready == 'true' && env.ZAP_REPORT_RECIPIENT != ''
         run: |
@@ -100,6 +111,16 @@ jobs:
             echo "::warning::ZAP_REPORT_AGE_RECIPIENT is not a variable of this repository; no report is kept"
           fi
           scripts/test/security-scan.sh --dast --env staging --public-log "${keep[@]}" --report-dir "$RUNNER_TEMP/zap"
+      - name: Attack tests against staging (T9)
+        if: ${{ !cancelled() && steps.key.outputs.ready == 'true' }}
+        timeout-minutes: 20
+        env:
+          BASE_URL: ${{ env.GOODFOOD_API_URL }}
+          QA_SIGNIN_KEY: ${{ secrets.QA_SIGNIN_KEY }}
+        run: |
+          set -euo pipefail
+          echo "source $(git rev-parse HEAD)"
+          go -C tests test -count=1 ./security/...
       - name: Keep the encrypted reports
         if: ${{ !cancelled() && steps.key.outputs.ready == 'true' && env.ZAP_REPORT_RECIPIENT != '' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
