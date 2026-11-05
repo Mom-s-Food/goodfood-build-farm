@@ -126,6 +126,14 @@ jobs:
           # Only main saves the Gradle cache, so branches never churn the repository cache.
           cache-read-only: ${{ github.event_name == 'repository_dispatch' && 'false' || 'true' }}
           add-job-summary: on-failure
+      # Robolectric fetches its Android jars at test time into ~/.m2, which setup-gradle does not cache.
+      - name: Keep Robolectric's Android jars between runs
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.m2/repository/org/robolectric
+          key: robolectric-${{ runner.os }}-${{ hashFiles('android/gradle/libs.versions.toml') }}
+          restore-keys: robolectric-${{ runner.os }}-
       - name: Static checks (module graph, ktlint, detekt, Lint)
         id: static
         if: ${{ env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
