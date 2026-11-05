@@ -99,7 +99,7 @@ jobs:
           [ -z "$SUITE" ] || printf '%s' "$SUITE" | grep -Eq '^[a-z0-9-]{1,40}$' || { echo "::error::bad suite name"; exit 1; }
           [ -z "$MAX_CASES" ] || printf '%s' "$MAX_CASES" | grep -Eq '^[1-9][0-9]{0,3}$' || { echo "::error::max_cases must be 1 to 9999 or empty"; exit 1; }
           [ -z "$CASES" ] || printf '%s' "$CASES" | grep -Eq '^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+){0,49}$' || { echo "::error::cases must be comma-separated case ids"; exit 1; }
-          printf '%s' "$MODELS" | grep -Eq '^claude-[a-z0-9-]+(,claude-[a-z0-9-]+){0,4}$' || { echo "::error::models must be comma-separated claude-* names"; exit 1; }
+          printf '%s' "$MODELS" | grep -Eq '^((openai:|gemini:)?[a-z][a-z0-9.-]+)(,(openai:|gemini:)?[a-z][a-z0-9.-]+){0,4}$' || { echo "::error::models must be comma-separated model names, openai: or gemini: naming another provider"; exit 1; }
           printf '%s' "$EFFORTS" | grep -Eq '^(low|medium|high|xhigh|max)(,(low|medium|high|xhigh|max)){0,4}$' || { echo "::error::bad efforts"; exit 1; }
           printf '%s' "$REPEATS" | grep -Eq '^[1-5]$' || { echo "::error::repeats must be 1 to 5"; exit 1; }
           printf '%s' "$MAX_COST" | grep -Eq '^[0-9]{1,2}(\.[0-9]{1,2})?$' || { echo "::error::max_cost_usd must be a number such as 2 or 0.50"; exit 1; }
@@ -135,6 +135,10 @@ jobs:
         env:
           # The key exists only in this step's environment; nothing below prints it.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY_DEV }}
+          # Multi-provider plan, section 7: empty until the owner creates them (D5); the provider-live
+          # suite skips a provider with no key. Synthetic data only.
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY_DEV }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY_DEV }}
           BRANCH: ${{ inputs.branch }}
           MODE: ${{ inputs.mode }}
           SUITE: ${{ inputs.suite }}
