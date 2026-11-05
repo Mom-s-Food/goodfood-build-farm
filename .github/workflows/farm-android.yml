@@ -12,6 +12,10 @@
 # task=record (by hand, a branch, never main): spotlessApply, the Room schema export and the
 #   Roborazzi baselines, recorded on this Linux runner, pushed to the branch as one commit that
 #   may change only android/.
+# task=apk (by hand, one commit SHA): builds the staging debug variant
+#   (app.goodfood.android.staging, talks to staging) for a real phone. No secret reaches the build
+#   and the APK is scanned for credential shapes before upload. An artifact of a public repository
+#   is open to any signed-in GitHub user and this APK is the private app's code, so it lives one day.
 #
 # Logs are public: test data is synthetic and nothing prints a secret.
 name: farm-android
@@ -22,15 +26,15 @@ on:
   workflow_dispatch:
     inputs:
       source_ref:
-        description: 'check: full commit SHA of Mom-s-Food/goodfood-main; empty checks main'
+        description: 'check, apk: full commit SHA of Mom-s-Food/goodfood-main; empty checks main (apk needs one)'
         required: false
         default: ''
       task:
-        description: 'check, or record (format, schemas, screenshot baselines) onto a branch'
+        description: 'check, record (format, schemas, screenshot baselines) onto a branch, or apk (staging debug)'
         required: false
         default: check
         type: choice
-        options: [check, record]
+        options: [check, record, apk]
       branch:
         description: 'record: the branch of goodfood-main to commit to (never main)'
         required: false
@@ -63,12 +67,15 @@ jobs:
           if [ -n "$REQUESTED" ] && ! printf '%s' "$REQUESTED" | grep -Eq '^[0-9a-f]{40}$'; then
             echo "::error::source_ref must be a full lowercase commit SHA"; exit 1
           fi
+          if [ "$TASK" = apk ] && [ -z "$REQUESTED" ]; then
+            echo "::error::apk needs source_ref, so the artifact names what it was built from"; exit 1
+          fi
           if [ "$TASK" = record ]; then
             printf '%s' "$BRANCH" | grep -Eq '^[A-Za-z0-9._/-]{1,100}$' || { echo "::error::record needs a branch"; exit 1; }
             case $BRANCH in main | refs/* | */main) echo "::error::refusing to write to $BRANCH"; exit 1 ;; esac
           fi
-      - name: Check out the private source (check)
-        if: ${{ env.TASK == 'check' }}
+      - name: Check out the private source (check, apk)
+        if: ${{ env.TASK != 'record' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ env.PRIVATE_REPO }}
@@ -198,6 +205,55 @@ jobs:
             git pull --rebase origin "$BRANCH"
           done
           echo "::error::could not push to $BRANCH"; exit 1
+
+      # apk
+      # AGP makes a new debug key on every fresh runner, and a phone refuses an update signed by another
+      # key. Caching it keeps one signature per ref (main's cache also serves branches). It is a debug
+      # key: it signs nothing but these test builds, and a cache entry idle for 7 days is evicted.
+      - name: Keep one debug signing key between APK builds
+        if: ${{ env.TASK == 'apk' && steps.gate.outputs.run == 'true' }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.android/debug.keystore
+          key: android-debug-keystore-v1
+      - name: Build the staging debug APK
+        if: ${{ env.TASK == 'apk' && steps.gate.outputs.run == 'true' }}
+        working-directory: android
+        run: ./gradlew --no-daemon :app:assembleStagingDebug
+      - name: Check the APK (no credential shapes; package, signature)
+        if: ${{ env.TASK == 'apk' && steps.gate.outputs.run == 'true' }}
+        env:
+          SHA: ${{ steps.gate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          apk=android/app/build/outputs/apk/staging/debug/app-staging-debug.apk
+          work="$(mktemp -d)"
+          unzip -q "$apk" -d "$work"
+          # Names only: a match must never reach this public log.
+          shapes='gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20}|sk-ant-[A-Za-z0-9_-]{20}|AIza[0-9A-Za-z_-]{35}|BEGIN [A-Z ]*PRIVATE KEY|xox[abprs]-[A-Za-z0-9-]{10}|ocid1\.[a-z]+\.oc[0-9]|https://[0-9a-f]{16,}@[a-z0-9.-]*sentry'
+          if hits="$(grep -rlaE "$shapes" "$work")"; then
+            printf '%s\n' "$hits" | sed "s|^$work/||"
+            echo "::error::the APK holds something shaped like a credential; nothing uploaded"; exit 1
+          fi
+          tools="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          out=android/app/build/outputs/apk/staging/debug/apk-info.txt
+          {
+            echo "source $SHA"
+            echo "apk sha256 $(sha256sum "$apk" | cut -d' ' -f1), $(stat -c %s "$apk") bytes"
+            "$tools/aapt" dump badging "$apk" | grep -E "^(package|sdkVersion|targetSdkVersion|uses-permission|application-label):"
+            "$tools/apksigner" verify --print-certs "$apk" | grep -E 'SHA-(1|256) digest'
+          } | tee "$out"
+          { echo '```'; cat "$out"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the APK for one day
+        if: ${{ env.TASK == 'apk' && steps.gate.outputs.run == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: goodfood-staging-debug-${{ steps.gate.outputs.sha }}
+          path: |
+            android/app/build/outputs/apk/staging/debug/app-staging-debug.apk
+            android/app/build/outputs/apk/staging/debug/apk-info.txt
+          retention-days: 1
+          if-no-files-found: error
 
       - name: Report the result to the private commit
         if: ${{ always() && env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
