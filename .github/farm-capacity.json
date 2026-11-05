@@ -10,6 +10,7 @@
     "farm-task": "one run per branch (group farm-task-<branch>), a single job that pushes to that branch",
     "farm-lint": "this check, on pushes to the farm",
     "farm-android": "dispatched with farm-ci (the same trigger-ci) and by hand; one job per commit, only when the commit changes Android paths",
+    "farm-android-e2e": "by hand per commit, the Android journeys on an emulator; one job, one run per commit",
     "farm-ios": "dispatched with farm-ci (the same trigger-ci) and by hand; one macOS job per commit, only when the commit changes iOS paths"
   },
   "background": {
