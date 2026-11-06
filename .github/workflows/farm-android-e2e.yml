@@ -19,6 +19,10 @@ on:
         description: 'Full commit SHA of Mom-s-Food/goodfood-main; empty runs the default branch below'
         required: false
         default: ''
+      upgrade_from:
+        description: 'Full commit SHA of the previous build: runs the upgrade journey from it instead (A10)'
+        required: false
+        default: ''
   push:
     branches: [android-e2e]
 
@@ -47,15 +51,26 @@ jobs:
       - name: Validate the request
         env:
           REF: ${{ inputs.source_ref }}
+          FROM: ${{ inputs.upgrade_from }}
         run: |
           set -euo pipefail
           [ -z "$REF" ] || printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::source_ref must be a full lowercase commit SHA"; exit 1; }
+          [ -z "$FROM" ] || printf '%s' "$FROM" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::upgrade_from must be a full lowercase commit SHA"; exit 1; }
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ secrets.PRIVATE_REPO_PAT }}
           ref: ${{ inputs.source_ref || env.DEFAULT_REF }}
           persist-credentials: false
+      - name: Check out the previous build's source
+        if: ${{ inputs.upgrade_from != '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ inputs.upgrade_from }}
+          persist-credentials: false
+          path: previous
       - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin
@@ -66,6 +81,10 @@ jobs:
           add-job-summary: on-failure
       - name: Build the staging release (R8, debug-signed, as the size check does)
         working-directory: android
+        run: ./gradlew -Pgoodfood.debugSignedRelease=true :app:assembleStagingRelease
+      - name: Build the previous staging release
+        if: ${{ inputs.upgrade_from != '' }}
+        working-directory: previous/android
         run: ./gradlew -Pgoodfood.debugSignedRelease=true :app:assembleStagingRelease
       - name: Maestro, pinned
         run: |
@@ -91,9 +110,11 @@ jobs:
         env:
           # The key exists only in this step's environment; nothing prints it.
           QA_SIGNIN_KEY: ${{ secrets.QA_SIGNIN_KEY }}
+          FROM: ${{ inputs.upgrade_from }}
         run: |
           bash scripts/test/android-journeys.sh \
             --apk android/app/build/outputs/apk/staging/release/app-staging-release.apk \
+            ${FROM:+--upgrade-from previous/android/app/build/outputs/apk/staging/release/app-staging-release.apk} \
             --out "$RUNNER_TEMP/journeys"
       - name: Summary
         if: ${{ always() }}
