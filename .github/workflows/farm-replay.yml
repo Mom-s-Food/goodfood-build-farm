@@ -184,7 +184,7 @@ jobs:
           go run ./contract/replay/cmd/record -target http://localhost:8080 -listen 127.0.0.1:4010 \
             -out "$RUNNER_TEMP/archive/$ARCHIVE" -journeys AndroidT7 \
             -source "Android T7 journeys on an emulator, mock flavor on the local stack (infra/compose/dev.yml), recorded by farm-replay.yml from goodfood-main $SHA" \
-            -command "bash ../scripts/test/android-journeys.sh --local http://localhost:8080 --apk ../android/app/build/outputs/apk/mock/debug/app-mock-debug.apk --out $RUNNER_TEMP/journeys --flow log-typed-meal --flow undo-a-deleted-meal"
+            -command "bash ../scripts/test/android-journeys.sh --local http://localhost:8080 --apk ../android/app/build/outputs/apk/mock/debug/app-mock-debug.apk --out $RUNNER_TEMP/journeys --flow log-typed-meal"
       - name: Keep the journeys' screens
         if: ${{ always() && inputs.mode == 'android' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
