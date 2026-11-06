@@ -135,10 +135,6 @@ jobs:
         env:
           # The key exists only in this step's environment; nothing below prints it.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY_DEV }}
-          # Multi-provider plan, section 7: empty until the owner creates them (D5); the provider-live
-          # suite skips a provider with no key. Synthetic data only.
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY_DEV }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY_DEV }}
           BRANCH: ${{ inputs.branch }}
           MODE: ${{ inputs.mode }}
           SUITE: ${{ inputs.suite }}
