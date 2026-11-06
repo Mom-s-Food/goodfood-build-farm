@@ -17,6 +17,13 @@
 #   and the APK is scanned for credential shapes before upload. An artifact of a public repository
 #   is open to any signed-in GitHub user and this APK is the private app's code, so it lives one day.
 #
+# task=bench (by hand, one commit SHA): the staging release (R8), the same unshrunk, and the
+#   Baseline Profile and Macrobenchmark APK, for a real phone (A10). Signed with the same cached
+#   debug key as task=apk, so they update the build already on the phone. Same scan, same one day.
+# task=mobsf (by hand, one commit SHA): the staging release through the private
+#   scripts/test/security-scan.sh --mobile: a pinned MobSF container on this runner. The log holds
+#   counts only. The findings, without code, are a one-day artifact to delete once read.
+#
 # Logs are public: test data is synthetic and nothing prints a secret.
 name: farm-android
 
@@ -30,11 +37,11 @@ on:
         required: false
         default: ''
       task:
-        description: 'check, record (format, schemas, screenshot baselines) onto a branch, or apk (staging debug)'
+        description: 'check, record (format, schemas, screenshot baselines) onto a branch, apk (staging debug), bench or mobsf'
         required: false
         default: check
         type: choice
-        options: [check, record, apk]
+        options: [check, record, apk, bench, mobsf]
       branch:
         description: 'record: the branch of goodfood-main to commit to (never main)'
         required: false
@@ -67,9 +74,11 @@ jobs:
           if [ -n "$REQUESTED" ] && ! printf '%s' "$REQUESTED" | grep -Eq '^[0-9a-f]{40}$'; then
             echo "::error::source_ref must be a full lowercase commit SHA"; exit 1
           fi
-          if [ "$TASK" = apk ] && [ -z "$REQUESTED" ]; then
-            echo "::error::apk needs source_ref, so the artifact names what it was built from"; exit 1
-          fi
+          case $TASK in apk | bench | mobsf)
+            if [ -z "$REQUESTED" ]; then
+              echo "::error::$TASK needs source_ref, so the artifact names what it was built from"; exit 1
+            fi ;;
+          esac
           if [ "$TASK" = record ]; then
             printf '%s' "$BRANCH" | grep -Eq '^[A-Za-z0-9._/-]{1,100}$' || { echo "::error::record needs a branch"; exit 1; }
             case $BRANCH in main | refs/* | */main) echo "::error::refusing to write to $BRANCH"; exit 1 ;; esac
@@ -211,7 +220,7 @@ jobs:
       # key. Caching it keeps one signature per ref (main's cache also serves branches). It is a debug
       # key: it signs nothing but these test builds, and a cache entry idle for 7 days is evicted.
       - name: Keep one debug signing key between APK builds
-        if: ${{ env.TASK == 'apk' && steps.gate.outputs.run == 'true' }}
+        if: ${{ (env.TASK == 'apk' || env.TASK == 'bench' || env.TASK == 'mobsf') && steps.gate.outputs.run == 'true' }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.android/debug.keystore
@@ -254,6 +263,60 @@ jobs:
             android/app/build/outputs/apk/staging/debug/apk-info.txt
           retention-days: 1
           if-no-files-found: error
+
+      # bench
+      - name: Build the release, the unshrunk release and the benchmark APK
+        if: ${{ env.TASK == 'bench' && steps.gate.outputs.run == 'true' }}
+        working-directory: android
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bench"
+          ./gradlew --no-daemon -Pgoodfood.debugSignedRelease=true -Pgoodfood.noMinify=true :app:assembleStagingRelease :baselineprofile:assembleStagingDebug
+          cp app/build/outputs/apk/staging/release/app-staging-release.apk "$RUNNER_TEMP/bench/app-unshrunk.apk"
+          cp baselineprofile/build/outputs/apk/staging/debug/*.apk "$RUNNER_TEMP/bench/benchmark.apk"
+          ./gradlew --no-daemon -Pgoodfood.debugSignedRelease=true :app:assembleStagingRelease
+          cp app/build/outputs/apk/staging/release/app-staging-release.apk "$RUNNER_TEMP/bench/app-release.apk"
+      - name: Check the APKs (no credential shapes)
+        if: ${{ env.TASK == 'bench' && steps.gate.outputs.run == 'true' }}
+        run: |
+          set -euo pipefail
+          shapes='gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20}|sk-ant-[A-Za-z0-9_-]{20}|AIza[0-9A-Za-z_-]{35}|BEGIN [A-Z ]*PRIVATE KEY|xox[abprs]-[A-Za-z0-9-]{10}|ocid1\.[a-z]+\.oc[0-9]|https://[0-9a-f]{16,}@[a-z0-9.-]*sentry'
+          tools="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          for apk in "$RUNNER_TEMP"/bench/*.apk; do
+            work="$(mktemp -d)"
+            unzip -q "$apk" -d "$work"
+            # Names only: a match must never reach this public log.
+            if hits="$(grep -rlaE "$shapes" "$work")"; then
+              printf '%s\n' "$hits" | sed "s|^$work/||"
+              echo "::error::$(basename "$apk") holds something shaped like a credential; nothing uploaded"; exit 1
+            fi
+            echo "$(basename "$apk") $(stat -c %s "$apk") bytes, $("$tools/apksigner" verify --print-certs "$apk" | grep -E 'SHA-256 digest' | head -1)"
+          done
+      - name: Keep the APKs for one day
+        if: ${{ env.TASK == 'bench' && steps.gate.outputs.run == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: goodfood-bench-${{ steps.gate.outputs.sha }}
+          path: ${{ runner.temp }}/bench/
+          retention-days: 1
+          if-no-files-found: error
+
+      # mobsf
+      - name: The staging release through MobSF
+        if: ${{ env.TASK == 'mobsf' && steps.gate.outputs.run == 'true' }}
+        run: |
+          set -euo pipefail
+          (cd android && ./gradlew --no-daemon -Pgoodfood.debugSignedRelease=true :app:assembleStagingRelease)
+          bash scripts/test/security-scan.sh --mobile android/app/build/outputs/apk/staging/release/app-staging-release.apk \
+            --report-dir "$RUNNER_TEMP/mobsf" --public-log
+      - name: Keep the findings for one day
+        if: ${{ !cancelled() && env.TASK == 'mobsf' && steps.gate.outputs.run == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mobsf-findings-${{ steps.gate.outputs.sha }}
+          path: ${{ runner.temp }}/mobsf/findings.json
+          retention-days: 1
+          if-no-files-found: ignore
 
       - name: Report the result to the private commit
         if: ${{ always() && env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
