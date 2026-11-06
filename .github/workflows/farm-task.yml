@@ -1,36 +1,23 @@
-# Runs one allowlisted, file-writing cargo task on a branch of the private
-# Mom-s-Food/goodfood-main repository and pushes the result back to that branch
-# as one commit. It exists because nobody builds the backend on a laptop (owner
-# rule, 2026-10-30): generated files that only a cargo run can produce are made
-# here. Tasks (each commits only the paths it owns; anything else changed fails the run):
-#   gen-cases         cargo run -p goodfood-evals --bin gen_cases -- --root ../evals [--suite NAME]
-#                     commits evals/
-#   write-recordings  cargo run -p goodfood-evals -- --root ../evals [--suite NAME]
-#                       --write-recordings testdata/recordings
-#                     the synthetic recordings (no key, no model call) of the held-out split on
-#                     the default grid; commits backend/testdata/recordings/ and evals/
-#   fmt               cargo fmt --all; commits backend/
-#   contracts         scripts/contracts/generate-rs.sh with openapi-to-rust 0.23.0 (the
-#                     generated API models and operation table from contracts/openapi);
-#                     commits backend/crates/api-types/
-# Never runs on main, never on a tag, never anything but the four tasks above.
-# Cache: Swatinem/rust-cache as in farm-ci.yml (compiled dependencies only, no workspace
-# crates or incremental state), one shared entry per Cargo.lock and toolchain.
+# Branch aip-live-bin only, not for farm main. Builds the evals command for Windows from one commit of the private
+# source and keeps it as a draft release of that private repository, so the provider live check can run on the owner's
+# machine with GEMINI_API_KEY_DEV in its environment: the key gets no farm copy (custody rule 5) and nobody runs cargo
+# there. The binary embeds the prompts, so it never becomes a public artifact of this repository. No key reaches this
+# workflow, and the build log uses the short message format, which prints no source lines.
 name: farm-task
 
 on:
   workflow_dispatch:
     inputs:
       branch:
-        description: 'Branch of Mom-s-Food/goodfood-main (not main)'
+        description: 'Full commit SHA of Mom-s-Food/goodfood-main'
         required: true
       task:
-        description: 'gen-cases, write-recordings, fmt or contracts'
+        description: 'Only evals-windows'
         required: true
         type: choice
-        options: [gen-cases, write-recordings, fmt, contracts]
+        options: [evals-windows]
       suite:
-        description: 'gen-cases and write-recordings: one suite name; empty does every suite'
+        description: 'Unused'
         required: false
         default: ''
 
@@ -38,94 +25,52 @@ permissions:
   contents: read
 
 concurrency:
-  group: farm-task-${{ inputs.branch }}
+  group: farm-task-evals-windows
   cancel-in-progress: false
 
 env:
   PRIVATE_REPO: Mom-s-Food/goodfood-main
   CARGO_TERM_COLOR: never
   CARGO_INCREMENTAL: "0"
-  # No debuginfo: smaller cache, faster link (as farm-ci.yml).
   CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
   task:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Validate the request
         env:
-          BRANCH: ${{ inputs.branch }}
-          SUITE: ${{ inputs.suite }}
+          SHA: ${{ inputs.branch }}
         run: |
           set -euo pipefail
-          printf '%s' "$BRANCH" | grep -Eq '^[A-Za-z0-9._/-]{1,100}$' || { echo "::error::bad branch name"; exit 1; }
-          case $BRANCH in main | refs/* | */main) echo "::error::refusing to write to $BRANCH"; exit 1 ;; esac
-          [ -z "$SUITE" ] || printf '%s' "$SUITE" | grep -Eq '^[a-z0-9-]{1,40}$' || { echo "::error::bad suite name"; exit 1; }
+          printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::give a full commit SHA"; exit 1; }
+      - name: Keep the source bytes as they are (the prompts are compiled in)
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ secrets.PRIVATE_REPO_PAT }}
           ref: ${{ inputs.branch }}
-      - name: Rust toolchain (stable, with rustfmt)
-        run: rustup toolchain install stable --profile minimal --component rustfmt --no-self-update
-      - name: Restore the dependency cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          workspaces: backend
-          shared-key: farm-task
-          cache-bin: "false"
-      - name: Run the task
+          persist-credentials: false
+      - name: Build the evals command
         working-directory: backend
-        env:
-          TASK: ${{ inputs.task }}
-          SUITE: ${{ inputs.suite }}
         run: |
           set -euo pipefail
-          case $TASK in
-            gen-cases)
-              if [ -n "$SUITE" ]; then
-                cargo run --quiet --locked -p goodfood-evals --bin gen_cases -- --root ../evals --suite "$SUITE"
-              else
-                cargo run --quiet --locked -p goodfood-evals --bin gen_cases -- --root ../evals
-              fi ;;
-            write-recordings)
-              if [ -n "$SUITE" ]; then
-                cargo run --quiet --locked -p goodfood-evals --bin evals -- --root ../evals --suite "$SUITE" --write-recordings testdata/recordings
-              else
-                cargo run --quiet --locked -p goodfood-evals --bin evals -- --root ../evals --write-recordings testdata/recordings
-              fi ;;
-            fmt) cargo fmt --all ;;
-            contracts)
-              cargo install --quiet --locked openapi-to-rust --version 0.23.0
-              (cd .. && scripts/contracts/generate-rs.sh) ;;
-          esac
-      - name: Commit and push the result to the branch
+          cargo build --quiet --locked --message-format=short -p goodfood-evals --bin evals
+          ls -la target/debug/evals.exe
+      - name: Keep it as a draft release of the private repository
         env:
-          BRANCH: ${{ inputs.branch }}
-          TASK: ${{ inputs.task }}
-          SUITE: ${{ inputs.suite }}
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
+          SHA: ${{ inputs.branch }}
         run: |
           set -euo pipefail
-          if [ -z "$(git status --porcelain)" ]; then echo "nothing changed"; exit 0; fi
-          git status --short
-          case $TASK in
-            gen-cases) owned='^(evals/)' ;;
-            write-recordings) owned='^(backend/testdata/recordings/|evals/)' ;;
-            fmt) owned='^(backend/)' ;;
-            contracts) owned='^(backend/crates/api-types/)' ;;
-          esac
-          stray=$(git status --porcelain --untracked-files=all | cut -c4- | grep -Ev "$owned" || true)
-          if [ -n "$stray" ]; then
-            printf '%s\n' "$stray"
-            echo "::error::$TASK changed files outside the paths it owns; nothing pushed"; exit 1
-          fi
-          git config user.name "goodfood-build-farm"
-          git config user.email "goodfood-build-farm@users.noreply.github.com"
-          git add -A
-          git commit -q -m "chore(farm): $TASK${SUITE:+ --suite $SUITE}" -m "Generated by goodfood-build-farm farm-task.yml run ${{ github.run_id }}."
-          for _ in 1 2 3; do
-            git push origin "HEAD:$BRANCH" && exit 0
-            git pull --rebase origin "$BRANCH"
-          done
-          echo "::error::could not push to $BRANCH"; exit 1
+          tag="evals-windows-${SHA:0:12}"
+          gh release create "$tag" --repo "$PRIVATE_REPO" --draft --title "$tag" \
+            --notes "Temporary: the evals command for the provider live check, built by farm run $GITHUB_RUN_ID. Delete after use." \
+            backend/target/debug/evals.exe
