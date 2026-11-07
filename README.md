@@ -22,6 +22,26 @@ and works on one pinned commit.
 The private repository sends both dispatches on every push to `main`
 (`.github/workflows/farm-dispatch.yml` there).
 
+## Private staging APK
+
+`farm-android.yml` accepts the opt-in `task=apk-private` with a full `source_ref` commit SHA. It builds
+`app.goodfood.android.staging` as a debug APK for physical-device testing, scans the package for
+credential shapes and verifies its package name and signature. The existing private-repository token
+uploads the APK, `SHA256SUMS` and `apk-info.txt` to a draft release of `Mom-s-Food/goodfood-main`.
+The public run summary gives the source commit, checksum, signing-certificate digest and private
+release tag. Each attempt gets a unique tag.
+
+```bash
+gh workflow run farm-android.yml -R Mom-s-Food/goodfood-build-farm \
+  -f task=apk-private -f source_ref="$(git -C ../goodfood-main rev-parse HEAD)"
+gh release download "$private_release_tag" -R Mom-s-Food/goodfood-main --dir "$private_build_dir"
+(cd "$private_build_dir" && sha256sum -c SHA256SUMS)
+```
+
+The tag is `android-staging-debug-<source-prefix>-<run-id>-<attempt>`, also printed in the run summary.
+Remove the temporary private draft release after the test build has been verified. The debug signing
+key cache supports updates between farm-built test APKs while that cache is available.
+
 ## Job budget
 
 The org is on GitHub Free: about **20 concurrent jobs for the whole org**, shared by every

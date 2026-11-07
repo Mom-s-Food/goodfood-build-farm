@@ -51,3 +51,4 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" install --quiet "pyyaml==$PYYAML_VERSION"
           "$RUNNER_TEMP/venv/bin/python" -I scripts/check-farm-workflows.py . | tee -a "$GITHUB_STEP_SUMMARY"
+          "$RUNNER_TEMP/venv/bin/python" -I -m unittest discover -s scripts -p 'test_*.py'

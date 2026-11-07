@@ -12,6 +12,9 @@
 # task=record (by hand, a branch, never main): spotlessApply, the Room schema export and the
 #   Roborazzi baselines, recorded on this Linux runner, pushed to the branch as one commit that
 #   may change only android/.
+# task=apk-private (by hand, one full commit SHA): builds the staging debug APK and
+#   uploads it with its checksum and build metadata to a draft release of the private
+#   source repository. The public farm keeps the run log and metadata only.
 #
 # Logs are public: test data is synthetic and nothing prints a secret.
 name: farm-android
@@ -22,15 +25,15 @@ on:
   workflow_dispatch:
     inputs:
       source_ref:
-        description: 'check: full commit SHA of Mom-s-Food/goodfood-main; empty checks main'
+        description: 'Full source commit SHA; check defaults to main, apk-private requires a SHA'
         required: false
         default: ''
       task:
-        description: 'check, or record (format, schemas, screenshot baselines) onto a branch'
+        description: 'check, record onto a branch, or apk-private for a physical-device test build'
         required: false
         default: check
         type: choice
-        options: [check, record]
+        options: [check, record, apk-private]
       branch:
         description: 'record: the branch of goodfood-main to commit to (never main)'
         required: false
@@ -60,15 +63,19 @@ jobs:
           BRANCH: ${{ inputs.branch }}
         run: |
           set -euo pipefail
+          case "$TASK" in check | record | apk-private) ;; *) echo "::error::unknown task"; exit 1 ;; esac
           if [ -n "$REQUESTED" ] && ! printf '%s' "$REQUESTED" | grep -Eq '^[0-9a-f]{40}$'; then
             echo "::error::source_ref must be a full lowercase commit SHA"; exit 1
+          fi
+          if [ "$TASK" = apk-private ] && [ -z "$REQUESTED" ]; then
+            echo "::error::apk-private needs a full source_ref"; exit 1
           fi
           if [ "$TASK" = record ]; then
             printf '%s' "$BRANCH" | grep -Eq '^[A-Za-z0-9._/-]{1,100}$' || { echo "::error::record needs a branch"; exit 1; }
             case $BRANCH in main | refs/* | */main) echo "::error::refusing to write to $BRANCH"; exit 1 ;; esac
           fi
-      - name: Check out the private source (check)
-        if: ${{ env.TASK == 'check' }}
+      - name: Check out the private source (check or apk-private)
+        if: ${{ env.TASK == 'check' || env.TASK == 'apk-private' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ env.PRIVATE_REPO }}
@@ -157,7 +164,7 @@ jobs:
         if: ${{ !cancelled() && env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
         run: bash android/scripts/size-check.sh
       - name: Keep the reports
-        if: ${{ failure() && steps.gate.outputs.run == 'true' }}
+        if: ${{ failure() && env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: android-reports-${{ github.run_id }}
@@ -168,6 +175,76 @@ jobs:
             android/build/reports/
           retention-days: 14
           if-no-files-found: ignore
+
+      # A debug key signs only staging test builds. Reusing it lets a later test
+      # APK update an earlier one. No store upload key is fetched by this task.
+      - name: Keep one debug signing key between private APK builds
+        if: ${{ env.TASK == 'apk-private' && steps.gate.outputs.run == 'true' }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.android/debug.keystore
+          key: android-debug-keystore-v1
+      - name: Build the staging debug APK for private delivery
+        if: ${{ env.TASK == 'apk-private' && steps.gate.outputs.run == 'true' }}
+        working-directory: android
+        run: ./gradlew --no-daemon :app:assembleStagingDebug
+      - name: Scan and describe the private APK
+        if: ${{ env.TASK == 'apk-private' && steps.gate.outputs.run == 'true' }}
+        env:
+          SHA: ${{ steps.gate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          apk=android/app/build/outputs/apk/staging/debug/app-staging-debug.apk
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          unzip -q "$apk" -d "$work"
+          shapes='gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20}|sk-[A-Za-z0-9_-]{20}|AIza[0-9A-Za-z_-]{35}|BEGIN [A-Z ]*PRIVATE KEY|xox[abprs]-[A-Za-z0-9-]{10}|ocid1\.[a-z]+\.oc[0-9]|https://[0-9a-f]{16,}@[a-z0-9.-]*sentry'
+          scan=0
+          grep -rqaE "$shapes" "$work" || scan=$?
+          case "$scan" in
+            1) ;;
+            0) echo "::error::credential-shaped content in APK; private upload stopped"; exit 1 ;;
+            *) echo "::error::APK credential scan failed; private upload stopped"; exit 1 ;;
+          esac
+          tools="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          "$tools/aapt" dump badging "$apk" > "$work/badging.txt"
+          grep -q "^package: name='app.goodfood.android.staging'" "$work/badging.txt"
+          out="$RUNNER_TEMP/private-apk"
+          mkdir -p "$out"
+          cp "$apk" "$out/app-staging-debug.apk"
+          (cd "$out" && sha256sum app-staging-debug.apk > SHA256SUMS)
+          {
+            echo "source $SHA"
+            cat "$out/SHA256SUMS"
+            echo "bytes $(stat -c %s "$apk")"
+            grep -E '^(package|sdkVersion|targetSdkVersion|application-label):' "$work/badging.txt"
+            "$tools/apksigner" verify --print-certs "$apk" | grep -E 'SHA-(1|256) digest'
+          } > "$out/apk-info.txt"
+          cat "$out/apk-info.txt"
+      - name: Deliver the APK to the private repository
+        if: ${{ env.TASK == 'apk-private' && steps.gate.outputs.run == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
+          SHA: ${{ steps.gate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          [ "$(gh api "repos/$PRIVATE_REPO" --jq '.private')" = true ] || {
+            echo "::error::APK destination must be a private repository"; exit 1;
+          }
+          tag="android-staging-debug-${SHA:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          out="$RUNNER_TEMP/private-apk"
+          gh release create "$tag" --repo "$PRIVATE_REPO" --draft --target "$SHA" --title "$tag" \
+            --notes-file "$out/apk-info.txt" \
+            "$out/app-staging-debug.apk" "$out/SHA256SUMS" "$out/apk-info.txt"
+          {
+            echo "### Private staging APK"
+            echo "Source \`$SHA\`"
+            echo "Private draft release \`$tag\` in \`$PRIVATE_REPO\`"
+            echo "Download with \`gh release download $tag -R $PRIVATE_REPO\` and verify SHA256SUMS."
+            echo '```'
+            cat "$out/apk-info.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # record
       - name: Format, export schemas, record screenshot baselines
