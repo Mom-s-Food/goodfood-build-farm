@@ -1,0 +1,56 @@
+# Read-only diagnosis of the original Why70 XCTest process termination.
+# No source checkout, test rerun, arbitrary input, or private-source credential.
+name: farm-ios-artifact-inspection
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+
+concurrency:
+  group: farm-ios-artifact-inspection
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - name: Download the pinned original synthetic test artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/original" "$RUNNER_TEMP/inspection"
+          gh api repos/Mom-s-Food/goodfood-build-farm/actions/artifacts/13575236607 \
+            --jq '[.id, .workflow_run.id, .name] | @tsv' > "$RUNNER_TEMP/artifact.tsv"
+          python3 - "$RUNNER_TEMP/artifact.tsv" <<'PY'
+          import pathlib
+          import sys
+          values = pathlib.Path(sys.argv[1]).read_text().strip().split("\t")
+          assert values == ["13575236607", "42372072434", "ios-reports-42372072434"], "Unexpected original artifact"
+          PY
+          gh run download 42372072434 --repo Mom-s-Food/goodfood-build-farm \
+            --name ios-reports-42372072434 --dir "$RUNNER_TEMP/original"
+      - name: Extract original XCTest termination diagnostics
+        run: |
+          set -euo pipefail
+          result=$(find "$RUNNER_TEMP/original" -type d -name '*.xcresult' -prune -print)
+          test -n "$result"
+          test "$(printf '%s\n' "$result" | wc -l | tr -d ' ')" = 1
+          out="$RUNNER_TEMP/inspection"
+          xcrun xcresulttool version > "$out/xcresulttool-version.txt"
+          xcrun xcresulttool get test-results summary --path "$result" > "$out/summary.json"
+          xcrun xcresulttool get test-results tests --path "$result" > "$out/tests.json"
+          xcrun xcresulttool get object --legacy --path "$result" --format json > "$out/root.json"
+          xcrun xcresulttool export diagnostics --path "$result" --output-path "$out/diagnostics"
+          printf 'Inspected original run 42372072434, artifact 13575236607. No tests executed.\n' >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve derived synthetic diagnostics
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ios-original-42372072434-inspection
+          path: ${{ runner.temp }}/inspection
+          if-no-files-found: error
+          retention-days: 3
