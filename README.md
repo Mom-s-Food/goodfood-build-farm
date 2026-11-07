@@ -86,3 +86,7 @@ For agents that dispatch farm runs:
   measures `main`) `farm-zap`'s nightly schedule (which scans staging from `main`) and `farm-probe`'s hourly backstop schedule and self-dispatched chain (which probe staging with the pinned or `main`'s `probe.sh`) start a run. Pull requests from forks
   never do, so outside code never runs with the token.
 - Deploying to OCI is a later step that needs the owner's approval.
+
+### Pinned iOS artifact inspection
+
+`farm-ios-artifact-inspection.yml` is a manual, read-only macOS diagnosis of synthetic test artifact `13575236607` from original run `42372072434`. It executes no app tests, checks out no source, and uses only the run token with `actions: read`. It exports XCTest summary and termination diagnostics with a three-day retention.
