@@ -359,7 +359,9 @@ jobs:
           tar -xzf "$audit" -C "$bin" --strip-components=1 "cargo-audit-x86_64-unknown-linux-musl-v${CARGO_AUDIT_VERSION}/cargo-audit"
           export PATH="$bin:$PATH"
           cargo deny --version | grep -F "cargo-deny $CARGO_DENY_VERSION"
-          cargo audit --version | grep -F "cargo-audit $CARGO_AUDIT_VERSION"
+          audit_version="$(cargo audit --version)"
+          printf '%s\n' "$audit_version"
+          [[ "$audit_version" == "cargo-audit-audit $CARGO_AUDIT_VERSION" ]]
           echo "$bin" >> "$GITHUB_PATH"
       - name: cargo-deny (policy in backend/deny.toml)
         run: cargo deny --manifest-path backend/Cargo.toml check
