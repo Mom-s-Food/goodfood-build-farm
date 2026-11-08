@@ -33,12 +33,19 @@ jobs:
         with:
           persist-credentials: false
       - name: actionlint
+        env:
+          RELEASE_API_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP"
           base="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}"
-          curl -fsSL --retry 3 -o actionlint.tgz "$base/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
-          curl -fsSL --retry 3 -o actionlint.sums "$base/actionlint_${ACTIONLINT_VERSION}_checksums.txt"
+          fetch() {
+            if curl -fsSL --connect-timeout 15 --max-time 180 --retry 2 --retry-max-time 240 -o "$2" "$1"; then return; fi
+            [[ "$ACTIONLINT_VERSION" == 1.7.12 ]] || { echo '::error::no pinned asset for this Actionlint version'; return 1; }
+            curl -fsSL --connect-timeout 15 --max-time 180 --retry 2 --retry-max-time 240 -H "Authorization: Bearer ${RELEASE_API_TOKEN:?}" -H 'Accept: application/octet-stream' -H 'X-GitHub-Api-Version: 2022-11-28' -o "$2" "https://api.github.com/repos/rhysd/actionlint/releases/assets/$3"
+          }
+          fetch "$base/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" actionlint.tgz 384924896
+          fetch "$base/actionlint_${ACTIONLINT_VERSION}_checksums.txt" actionlint.sums 384924918
           grep " actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz\$" actionlint.sums | sed 's/ .*/  actionlint.tgz/' | sha256sum -c -
           tar -xzf actionlint.tgz actionlint
           cd "$GITHUB_WORKSPACE"
