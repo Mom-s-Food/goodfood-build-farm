@@ -377,6 +377,8 @@ jobs:
               kubeconform.*) [[ "$KUBECONFORM_VERSION" == v0.8.0 ]] || return 1 ;;
               gitleaks.*) [[ "$GITLEAKS_VERSION" == 8.30.1 ]] || return 1 ;;
               actionlint.*) [[ "$ACTIONLINT_VERSION" == 1.7.12 ]] || return 1 ;;
+              tofu.zip) [[ "$TOFU_VERSION" == 1.12.1 ]] || return 1 ;;
+              tflint.zip) [[ "$TFLINT_VERSION" == v0.64.0 ]] || return 1 ;;
               *) echo "::error::no pinned official asset for $2"; return 1 ;;
             esac
             case "$2" in
@@ -388,6 +390,8 @@ jobs:
               gitleaks.sums) asset=378333193 ;;
               actionlint.tgz) asset=384924896 ;;
               actionlint.sums) asset=384924918 ;;
+              tofu.zip) asset=430979398 ;;
+              tflint.zip) asset=480528344 ;;
               *) echo "::error::no pinned official asset for $2"; return 1 ;;
             esac
             echo "Release download unavailable; trying the pinned official asset API for $2"
@@ -405,6 +409,17 @@ jobs:
           fetch "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" actionlint.tgz rhysd/actionlint
           fetch "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_checksums.txt" actionlint.sums rhysd/actionlint
           grep " actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz\$" actionlint.sums | sed 's/ .*/  actionlint.tgz/' | sha256sum -c -
+          # These archive digests are pinned to Linux/X64 and the version guards above.
+          [[ "${RUNNER_OS:-}" == Linux && "${RUNNER_ARCH:-}" == X64 && "$TOFU_VERSION" == 1.12.1 && "$TFLINT_VERSION" == v0.64.0 ]] || { echo '::error::unsupported infra tool pins or runner'; exit 1; }
+          fetch "https://github.com/opentofu/opentofu/releases/download/v${TOFU_VERSION}/tofu_${TOFU_VERSION}_linux_amd64.zip" tofu.zip opentofu/opentofu
+          echo '1fc9af962e3632b7cd0ba27076cd9f1ced177567defe9e331ac37f5a40468575  tofu.zip' | sha256sum -c -
+          fetch "https://github.com/terraform-linters/tflint/releases/download/${TFLINT_VERSION}/tflint_linux_amd64.zip" tflint.zip terraform-linters/tflint
+          echo 'cca9d13e2e1d7a2c627af60ff899a3c9b74212899416aeb96ec764d2ef954537  tflint.zip' | sha256sum -c -
+          unzip -q -o tofu.zip tofu -d "$bin"
+          unzip -q -o tflint.zip tflint -d "$bin"
+          export PATH="$bin:$PATH"
+          "$bin/tofu" version | grep -F "OpenTofu v$TOFU_VERSION"
+          "$bin/tflint" --version | grep -F "TFLint version ${TFLINT_VERSION#v}"
           tar -xzf kustomize.tgz -C "$bin" kustomize
           tar -xzf kubeconform.tgz -C "$bin" kubeconform
           tar -xzf gitleaks.tgz -C "$bin" gitleaks
@@ -581,11 +596,7 @@ jobs:
         run: go test -count=1 ./contract/replay/...
 
       # infra
-      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
-        if: ${{ !cancelled() }}
-        with:
-          tofu_version: ${{ env.TOFU_VERSION }}
-          tofu_wrapper: false
+
       - name: OpenTofu format
         if: ${{ !cancelled() }}
         run: tofu fmt -check -recursive infra/tofu
@@ -609,10 +620,7 @@ jobs:
             tofu -chdir="$root" validate
             echo "::endgroup::"
           done
-      - uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
-        if: ${{ !cancelled() }}
-        with:
-          tflint_version: ${{ env.TFLINT_VERSION }}
+
       - name: TFLint
         if: ${{ !cancelled() }}
         env:
