@@ -371,6 +371,14 @@ jobs:
           fetch() {
             if curl -fsSL --retry 3 -o "$2" "$1"; then return; fi
             local asset
+            # Asset IDs are pinned to these versions. Fail rather than silently install an older tool.
+            case "$2" in
+              kustomize.*) [[ "$KUSTOMIZE_VERSION" == v5.8.1 ]] || return 1 ;;
+              kubeconform.*) [[ "$KUBECONFORM_VERSION" == v0.8.0 ]] || return 1 ;;
+              gitleaks.*) [[ "$GITLEAKS_VERSION" == 8.30.1 ]] || return 1 ;;
+              actionlint.*) [[ "$ACTIONLINT_VERSION" == 1.7.12 ]] || return 1 ;;
+              *) echo "::error::no pinned official asset for $2"; return 1 ;;
+            esac
             case "$2" in
               kustomize.tgz) asset=353160972 ;;
               kustomize.sums) asset=353160973 ;;
