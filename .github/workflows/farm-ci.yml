@@ -369,7 +369,7 @@ jobs:
           set -euo pipefail
           bin="$RUNNER_TEMP/bin"; mkdir -p "$bin"; cd "$RUNNER_TEMP"
           fetch() {
-            if curl -fsSL --retry 3 -o "$2" "$1"; then return; fi
+            if curl -fsSL --connect-timeout 15 --max-time 180 --retry 2 --retry-max-time 240 -o "$2" "$1"; then return; fi
             local asset
             # Asset IDs are pinned to these versions. Fail rather than silently install an older tool.
             case "$2" in
@@ -391,7 +391,7 @@ jobs:
               *) echo "::error::no pinned official asset for $2"; return 1 ;;
             esac
             echo "Release download unavailable; trying the pinned official asset API for $2"
-            curl -fsSL --retry 3 -H 'Accept: application/octet-stream' -H 'X-GitHub-Api-Version: 2022-11-28' -o "$2" "https://api.github.com/repos/$3/releases/assets/$asset"
+            curl -fsSL --connect-timeout 15 --max-time 180 --retry 2 --retry-max-time 240 -H 'Accept: application/octet-stream' -H 'X-GitHub-Api-Version: 2022-11-28' -o "$2" "https://api.github.com/repos/$3/releases/assets/$asset"
           }
           fetch "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" kustomize.tgz kubernetes-sigs/kustomize
           fetch "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/checksums.txt" kustomize.sums kubernetes-sigs/kustomize
