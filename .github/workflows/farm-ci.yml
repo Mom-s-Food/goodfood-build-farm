@@ -368,18 +368,34 @@ jobs:
         run: |
           set -euo pipefail
           bin="$RUNNER_TEMP/bin"; mkdir -p "$bin"; cd "$RUNNER_TEMP"
-          fetch() { curl -fsSL --retry 3 -o "$2" "$1"; }
-          fetch "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" kustomize.tgz
-          fetch "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/checksums.txt" kustomize.sums
+          fetch() {
+            if curl -fsSL --retry 3 -o "$2" "$1"; then return; fi
+            local asset
+            case "$2" in
+              kustomize.tgz) asset=353160972 ;;
+              kustomize.sums) asset=353160973 ;;
+              kubeconform.tgz) asset=438612666 ;;
+              kubeconform.sums) asset=438612682 ;;
+              gitleaks.tgz) asset=378332058 ;;
+              gitleaks.sums) asset=378333193 ;;
+              actionlint.tgz) asset=384924896 ;;
+              actionlint.sums) asset=384924918 ;;
+              *) echo "::error::no pinned official asset for $2"; return 1 ;;
+            esac
+            echo "Release download unavailable; trying the pinned official asset API for $2"
+            curl -fsSL --retry 3 -H 'Accept: application/octet-stream' -H 'X-GitHub-Api-Version: 2022-11-28' -o "$2" "https://api.github.com/repos/$3/releases/assets/$asset"
+          }
+          fetch "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" kustomize.tgz kubernetes-sigs/kustomize
+          fetch "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/checksums.txt" kustomize.sums kubernetes-sigs/kustomize
           grep " kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz\$" kustomize.sums | sed 's/ .*/  kustomize.tgz/' | sha256sum -c -
-          fetch "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" kubeconform.tgz
-          fetch "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/CHECKSUMS" kubeconform.sums
+          fetch "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" kubeconform.tgz yannh/kubeconform
+          fetch "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/CHECKSUMS" kubeconform.sums yannh/kubeconform
           grep " kubeconform-linux-amd64.tar.gz\$" kubeconform.sums | sed 's/ .*/  kubeconform.tgz/' | sha256sum -c -
-          fetch "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" gitleaks.tgz
-          fetch "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_checksums.txt" gitleaks.sums
+          fetch "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" gitleaks.tgz gitleaks/gitleaks
+          fetch "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_checksums.txt" gitleaks.sums gitleaks/gitleaks
           grep " gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz\$" gitleaks.sums | sed 's/ .*/  gitleaks.tgz/' | sha256sum -c -
-          fetch "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" actionlint.tgz
-          fetch "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_checksums.txt" actionlint.sums
+          fetch "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" actionlint.tgz rhysd/actionlint
+          fetch "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_checksums.txt" actionlint.sums rhysd/actionlint
           grep " actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz\$" actionlint.sums | sed 's/ .*/  actionlint.tgz/' | sha256sum -c -
           tar -xzf kustomize.tgz -C "$bin" kustomize
           tar -xzf kubeconform.tgz -C "$bin" kubeconform
