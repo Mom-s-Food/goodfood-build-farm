@@ -17,14 +17,16 @@ jobs:
       - name: Resolve the selected workspace graph without building
         working-directory: backend
         run: |
+          set +e
           set -uo pipefail
           rustup toolchain install stable --profile minimal --no-self-update
-          cargo +stable tree --locked --workspace --target x86_64-unknown-linux-gnu --edges normal,build --invert libsqlite3-sys
+          cargo +stable tree --locked --workspace --target all --edges normal,build --invert libsqlite3-sys
           echo "normal-build-tree-exit=$?"
-          cargo +stable tree --locked --workspace --target x86_64-unknown-linux-gnu --edges normal,build,dev --invert libsqlite3-sys
+          cargo +stable tree --locked --workspace --target all --edges normal,build,dev --invert libsqlite3-sys
           echo "test-tree-exit=$?"
-          cargo +stable tree --locked --workspace --target x86_64-unknown-linux-gnu --edges features --invert sqlx
+          cargo +stable tree --locked --workspace --target all --edges features --invert sqlx
           echo "sqlx-feature-tree-exit=$?"
+          cargo +stable search sqlx --limit 1
           cargo +stable update --dry-run --package libsqlite3-sys --precise 0.39.0
           echo "precise-update-dry-run-exit=$?"
           git diff --exit-code -- Cargo.lock
