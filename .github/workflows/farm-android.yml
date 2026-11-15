@@ -63,6 +63,7 @@ jobs:
           BRANCH: ${{ inputs.branch }}
         run: |
           set -euo pipefail
+          [ "$TASK" = check ] || { echo 'diagnostic branch permits check only'; exit 1; }
           case "$TASK" in check | record | apk-private) ;; *) echo "::error::unknown task"; exit 1 ;; esac
           if [ -n "$REQUESTED" ] && ! printf '%s' "$REQUESTED" | grep -Eq '^[0-9a-f]{40}$'; then
             echo "::error::source_ref must be a full lowercase commit SHA"; exit 1
@@ -114,7 +115,7 @@ jobs:
             echo "run=false" >> "$GITHUB_OUTPUT"; echo "no Android change since $base"
           fi
       - name: Mark the private commit pending
-        if: ${{ env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
+        if: ${{ false }}
         env:
           GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
           SHA: ${{ steps.gate.outputs.sha }}
@@ -141,11 +142,69 @@ jobs:
           path: ~/.m2/repository/org/robolectric
           key: robolectric-${{ runner.os }}-${{ hashFiles('android/gradle/libs.versions.toml') }}
           restore-keys: robolectric-${{ runner.os }}-
+      # Diagnostic-only: a doFirst action observes KSP's configured library inputs.
+      # This changes timing; a passing run cannot rule out a race.
+      - name: Prepare read-only KSP input trace
+        if: ${{ steps.gate.outputs.run == 'true' && env.TASK == 'check' }}
+        env:
+          KSP_TRACE_INIT: |
+            import java.security.MessageDigest
+            import java.util.zip.ZipFile
+            def hex = { byte[] bytes -> bytes.collect { String.format('%02x', it & 0xff) }.join() }
+            def shaText = { String value -> hex(MessageDigest.getInstance('SHA-256').digest(value.getBytes('UTF-8'))) }
+            def shaFile = { File file ->
+                def md = MessageDigest.getInstance('SHA-256')
+                file.withInputStream { stream ->
+                    byte[] buf = new byte[65536]
+                    int n
+                    while ((n = stream.read(buf)) != -1) md.update(buf, 0, n)
+                }
+                hex(md.digest())
+            }
+            def targets = ['CaptureStore', 'ConnectionStore', 'ImportStore', 'KitchenStore']
+                .collect { 'app/goodfood/core/sync/' + it + '.class' }
+            gradle.beforeProject { project ->
+                if (project.path == ':feature:kitchen') {
+                    project.tasks.matching { it.name == 'kspDebugKotlin' }.configureEach { task ->
+                        task.doFirst {
+                            try {
+                                def config = task.kspConfig
+                                def libraries = config.libraries.files.sort { a, b -> a.absolutePath <=> b.absolutePath }
+                                def structure = config.classpathStructure.files.collect { f -> f.absolutePath + ':' + f.length() }.sort().join('\n')
+                                println('KSP_TRACE incremental=' + config.incremental.orNull + ' libraryCount=' + libraries.size() +
+                                    ' structureCount=' + config.classpathStructure.files.size() + ' structureHash=' + shaText(structure))
+                                libraries.each { file ->
+                                    def present = []
+                                    if (file.isDirectory()) {
+                                        present = targets.findAll { new File(file, it).isFile() }
+                                        present.each { name ->
+                                            println('KSP_TRACE class=' + name + ' libraryPathHash=' + shaText(file.absolutePath) +
+                                                ' classHash=' + shaFile(new File(file, name)))
+                                        }
+                                    } else if (file.isFile() && (file.name.endsWith('.jar') || file.name.endsWith('.zip'))) {
+                                        new ZipFile(file).withCloseable { zip -> present = targets.findAll { zip.getEntry(it) != null } }
+                                        if (!present.isEmpty()) {
+                                            println('KSP_TRACE classes=' + present.join(',') + ' libraryPathHash=' + shaText(file.absolutePath) +
+                                                ' libraryHash=' + shaFile(file))
+                                        }
+                                    }
+                                }
+                            } catch (LinkageError problem) {
+                                println('KSP_TRACE unavailable=' + problem.class.name)
+                            } catch (Exception problem) {
+                                // Observation failure is explicit and cannot change the underlying gate.
+                                println('KSP_TRACE unavailable=' + problem.class.name)
+                            }
+                        }
+                    }
+                }
+            }
+        run: printf '%s\n' "$KSP_TRACE_INIT" > "$RUNNER_TEMP/ksp-trace.gradle"
       - name: Static checks (module graph, ktlint, detekt, Lint)
         id: static
         if: ${{ env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
         working-directory: android
-        run: ./gradlew --continue checkModuleGraph ciFormat detektAll ciLint
+        run: ./gradlew --continue checkModuleGraph ciFormat detektAll ciLint --init-script "$RUNNER_TEMP/ksp-trace.gradle"
       - name: KSP evidence after static checks
         if: ${{ !cancelled() && env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
         working-directory: android
@@ -165,7 +224,7 @@ jobs:
         id: tests
         if: ${{ !cancelled() && env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
         working-directory: android
-        run: ./gradlew --continue ciUnitTest ciScreenshots
+        run: ./gradlew --continue ciUnitTest ciScreenshots --init-script "$RUNNER_TEMP/ksp-trace.gradle"
       - name: KSP evidence after tests
         if: ${{ !cancelled() && env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
         working-directory: android
@@ -308,7 +367,7 @@ jobs:
           echo "::error::could not push to $BRANCH"; exit 1
 
       - name: Report the result to the private commit
-        if: ${{ always() && env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
+        if: ${{ false }}
         env:
           GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
           SHA: ${{ steps.gate.outputs.sha }}
