@@ -1,6 +1,7 @@
 # Runs the AI evaluation suites (lane T5) of the private Mom-s-Food/goodfood-main repository against
-# the real Claude API with the development key (ANTHROPIC_API_KEY_DEV, its own Anthropic workspace
-# with a spend cap). Every run costs money, so it starts only by hand, one at a time, with a case cap
+# OpenAI only with the existing development key (OPENAI_API_KEY_DEV). Luna is the default;
+# Terra remains unavailable until pricing and its cap are verified. Every run costs money,
+# so it starts only by hand, one at a time, with a case cap
 # and a hard cost cap (`evals --max-cost-usd`: no call is sent once the run has spent that much).
 #   live    score the suites live; the report goes to the run summary and an artifact; no commit
 #   record  the same calls, each answer written to backend/testdata/recordings and pushed to the
@@ -16,9 +17,9 @@ on:
   workflow_dispatch:
     inputs:
       branch:
-        description: 'Branch of Mom-s-Food/goodfood-main (record mode: not main)'
+        description: 'Reviewed commit or branch pointing to it (record mode requires a branch)'
         required: true
-        default: main
+        default: 99b128cd515985c9cf0068629d052306d542e725
       mode:
         description: 'live (score only) or record (also commit the recordings to the branch)'
         required: true
@@ -44,9 +45,11 @@ on:
         options: [heldout, dev, all]
         default: heldout
       models:
-        description: 'Comma-separated models (each one is a pair with each effort)'
+        description: 'OpenAI Luna; Terra requires verified pricing and a cost cap'
         required: true
-        default: claude-haiku-5-5
+        type: choice
+        options: [gpt-6-luna]
+        default: gpt-6-luna
       efforts:
         description: 'Comma-separated efforts'
         required: true
@@ -89,6 +92,7 @@ jobs:
           EFFORTS: ${{ inputs.efforts }}
           REPEATS: ${{ inputs.repeats }}
           MAX_COST: ${{ inputs.max_cost_usd }}
+          SPLIT: ${{ inputs.split }}
         run: |
           set -euo pipefail
           printf '%s' "$BRANCH" | grep -Eq '^[A-Za-z0-9._/-]{1,100}$' || { echo "::error::bad branch name"; exit 1; }
@@ -97,9 +101,12 @@ jobs:
             case $BRANCH in main | */main) echo "::error::record mode refuses to write to $BRANCH"; exit 1 ;; esac
           fi
           [ -z "$SUITE" ] || printf '%s' "$SUITE" | grep -Eq '^[a-z0-9-]{1,40}$' || { echo "::error::bad suite name"; exit 1; }
+          [ "$SUITE" != provider-batch-live ] || { echo "::error::batch diagnostic requires a durable resumable receipt; use the local batch wrapper"; exit 1; }
           [ -z "$MAX_CASES" ] || printf '%s' "$MAX_CASES" | grep -Eq '^[1-9][0-9]{0,3}$' || { echo "::error::max_cases must be 1 to 9999 or empty"; exit 1; }
           [ -z "$CASES" ] || printf '%s' "$CASES" | grep -Eq '^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+){0,49}$' || { echo "::error::cases must be comma-separated case ids"; exit 1; }
-          printf '%s' "$MODELS" | grep -Eq '^claude-[a-z0-9-]+(,claude-[a-z0-9-]+){0,4}$' || { echo "::error::models must be comma-separated claude-* names"; exit 1; }
+          case "$MODELS" in gpt-6-luna) ;; *) echo "::error::only priced gpt-6-luna is enabled"; exit 1 ;; esac
+          case "$MODE" in live | record) ;; *) echo "::error::mode must be live or record"; exit 1 ;; esac
+          case "$SPLIT" in dev | heldout | all) ;; *) echo "::error::bad split"; exit 1 ;; esac
           printf '%s' "$EFFORTS" | grep -Eq '^(low|medium|high|xhigh|max)(,(low|medium|high|xhigh|max)){0,4}$' || { echo "::error::bad efforts"; exit 1; }
           printf '%s' "$REPEATS" | grep -Eq '^[1-5]$' || { echo "::error::repeats must be 1 to 5"; exit 1; }
           printf '%s' "$MAX_COST" | grep -Eq '^[0-9]{1,2}(\.[0-9]{1,2})?$' || { echo "::error::max_cost_usd must be a number such as 2 or 0.50"; exit 1; }
@@ -110,8 +117,16 @@ jobs:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ secrets.PRIVATE_REPO_PAT }}
           ref: ${{ inputs.branch }}
+          fetch-depth: 0
           # Only record mode pushes; a live run keeps no credential on disk.
           persist-credentials: ${{ inputs.mode == 'record' }}
+      - name: Require the reviewed OpenAI evaluation source
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = 99b128cd515985c9cf0068629d052306d542e725 ] || {
+            echo '::error::source commit is not the reviewed OpenAI evaluation source; no provider request was sent'
+            exit 1
+          }
       - name: Rust toolchain (stable)
         run: rustup toolchain install stable --profile minimal --no-self-update
       - name: Cache the cargo registry and target directory
@@ -129,12 +144,14 @@ jobs:
       - name: Build the evals command
         working-directory: backend
         run: cargo build --quiet --locked -p goodfood-evals --bin evals
-      - name: Run the suites (calls the Claude API; costs money)
+      - name: Run the suites (OpenAI only; costs money)
         id: run
         working-directory: backend
         env:
           # The key exists only in this step's environment; nothing below prints it.
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY_DEV }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY_DEV }}
+          # provider-live bypasses the grid flags; scope that shortcut explicitly too.
+          PROVIDER_LIVE_MODEL: ${{ inputs.models }}
           BRANCH: ${{ inputs.branch }}
           MODE: ${{ inputs.mode }}
           SUITE: ${{ inputs.suite }}
@@ -147,10 +164,11 @@ jobs:
           MAX_COST: ${{ inputs.max_cost_usd }}
         run: |
           set -euo pipefail
-          [ -n "$ANTHROPIC_API_KEY" ] || { echo "::error::the ANTHROPIC_API_KEY_DEV secret is not set on this repository"; exit 1; }
+          [ -n "$OPENAI_API_KEY" ] || { echo "::error::the OPENAI_API_KEY_DEV secret is not set on this repository; no provider request was sent"; exit 1; }
           out="$RUNNER_TEMP/evals-report"
           mkdir -p "$out"
-          args=(--root ../evals --run --mode "$MODE" --split "$SPLIT" --models "$MODELS" --efforts "$EFFORTS"
+          args=(--root ../evals --run --mode "$MODE" --split "$SPLIT" --models "openai:$MODELS" --efforts "$EFFORTS"
+                --judge-model gpt-6-luna --judge-effort low --parallel 1
                 --repeats "$REPEATS" --max-cost-usd "$MAX_COST" --json "$out/report.json")
           [ -z "$SUITE" ] || args+=(--suite "$SUITE")
           [ -z "$MAX_CASES" ] || args+=(--max-cases "$MAX_CASES")
