@@ -1,0 +1,30 @@
+name: sqlite-diagnostic
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  graph:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Mom-s-Food/goodfood-main
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: a9d313d52bccf0e7818ad2901e02deb445b0aad7
+          persist-credentials: false
+      - name: Resolve the selected workspace graph without building
+        working-directory: backend
+        run: |
+          set -uo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update
+          cargo +stable tree --locked --workspace --target x86_64-unknown-linux-gnu --edges normal,build --invert libsqlite3-sys
+          echo "normal-build-tree-exit=$?"
+          cargo +stable tree --locked --workspace --target x86_64-unknown-linux-gnu --edges normal,build,dev --invert libsqlite3-sys
+          echo "test-tree-exit=$?"
+          cargo +stable tree --locked --workspace --target x86_64-unknown-linux-gnu --edges features --invert sqlx
+          echo "sqlx-feature-tree-exit=$?"
+          cargo +stable update --dry-run --package libsqlite3-sys --precise 0.39.0
+          echo "precise-update-dry-run-exit=$?"
+          git diff --exit-code -- Cargo.lock
