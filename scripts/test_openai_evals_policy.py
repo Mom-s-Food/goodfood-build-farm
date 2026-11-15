@@ -63,8 +63,9 @@ class OpenAiEvalsPolicy(unittest.TestCase):
     def test_old_source_is_rejected_before_the_paid_step(self):
         checkout = step("Check out the private source")
         self.assertEqual(checkout["with"]["fetch-depth"], 0)
-        gate = step("Require the OpenAI-only evaluation baseline")
-        self.assertIn("git merge-base --is-ancestor ba5a2c4f9134706509843e859688d89a4feac4a0 HEAD", gate["run"])
+        gate = step("Require the reviewed OpenAI evaluation source")
+        self.assertIn("99b128cd515985c9cf0068629d052306d542e725", gate["run"])
+        self.assertIn('$(git rev-parse HEAD)', gate["run"])
         self.assertLess(STEPS.index(gate), STEPS.index(step("Run the suites (OpenAI only; costs money)")))
 
     def test_missing_openai_key_exits_before_creating_report_or_running_binary(self):

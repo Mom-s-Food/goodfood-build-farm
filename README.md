@@ -81,7 +81,7 @@ For agents that dispatch farm runs:
 
 ## Rules
 
-The owner's current model policy prohibits Anthropic and Gemini model calls. The manual paid evaluation workflow injects no credential for either, accepts only the exact Luna selector and explicitly selects Luna for rubric judging. The `provider-live` shortcut is scoped through `PROVIDER_LIVE_MODEL` too. No paid evaluation runs on a schedule. Metadata inspection on 2026-11-15 found the OpenAI farm secret absent; implementing this workflow does not create it or prove key usability.
+The owner's current model policy prohibits Anthropic and Gemini model calls. The manual paid evaluation workflow injects no credential for either, accepts only the exact Luna selector and explicitly selects Luna for rubric judging. The `provider-live` shortcut is scoped through `PROVIDER_LIVE_MODEL` too. Until a stronger runtime admission guard is verified, the workflow requires the reviewed source commit `99b128cd515985c9cf0068629d052306d542e725`; any other source requires a separate review and policy update. No paid evaluation runs on a schedule. Metadata inspection on 2026-11-15 found the OpenAI farm secret absent; implementing this workflow does not create it or prove key usability.
 
 Scheduled paths were audited on farm source `9754fbeb3af304c5531e22f730296d13d241621b`: fuzz/performance execute tests without model credentials; replay and synthetic stacks use simulated AI; external probes, staging journeys and ZAP can exercise deployed staging and therefore depend on its OpenAI-only/safe simulated configuration and spend caps. Those workflows inject only synthetic sign-in credentials, never provider keys. API health alone does not prove worker or provider-mode convergence.
 
