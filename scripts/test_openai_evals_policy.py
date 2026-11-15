@@ -33,17 +33,17 @@ class OpenAiEvalsPolicy(unittest.TestCase):
         self.assertEqual(set(triggers), {"workflow_dispatch"})
         models = triggers["workflow_dispatch"]["inputs"]["models"]
         self.assertEqual(models["default"], "gpt-6-luna")
-        self.assertEqual(models["options"], ["gpt-6-luna", "gpt-6-terra"])
+        self.assertEqual(models["options"], ["gpt-6-luna", "gpt-6.1-terra"])
         self.assertEqual(self.validate().returncode, 0)
 
     def test_unknown_legacy_and_multi_model_requests_fail_before_keys(self):
         for model in ("claude-haiku-5-5", "gemini-3.5-flash", "gpt-6-unknown",
-                      "gpt-6-luna,gpt-6-terra", "openai:gpt-6-luna"):
+                      "gpt-6-luna,gpt-6.1-terra", "openai:gpt-6-luna"):
             with self.subTest(model=model):
                 self.assertNotEqual(self.validate(MODELS=model).returncode, 0)
 
     def test_terra_requires_selected_small_development_cases(self):
-        valid = dict(MODELS="gpt-6-terra", SPLIT="dev", CASES="photo-01", MAX_CASES="1")
+        valid = dict(MODELS="gpt-6.1-terra", SPLIT="dev", CASES="photo-01", MAX_CASES="1")
         self.assertEqual(self.validate(**valid).returncode, 0)
         for change in ({"CASES": ""}, {"SUITE": ""}, {"SPLIT": "heldout"},
                        {"REPEATS": "2"}, {"MAX_COST": "0.26"}, {"MAX_CASES": "4"},
