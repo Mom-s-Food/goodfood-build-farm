@@ -1,6 +1,6 @@
 # Runs the AI evaluation suites (lane T5) of the private Mom-s-Food/goodfood-main repository against
 # OpenAI only with the existing development key (OPENAI_API_KEY_DEV). Luna is the default;
-# Terra requires explicitly selected small development cases. Every run costs money,
+# Terra remains unavailable until pricing and its cap are verified. Every run costs money,
 # so it starts only by hand, one at a time, with a case cap
 # and a hard cost cap (`evals --max-cost-usd`: no call is sent once the run has spent that much).
 #   live    score the suites live; the report goes to the run summary and an artifact; no commit
@@ -45,10 +45,10 @@ on:
         options: [heldout, dev, all]
         default: heldout
       models:
-        description: 'One OpenAI model; Terra requires explicit dev suite/cases and a USD 0.25 cap'
+        description: 'OpenAI Luna; Terra requires verified pricing and a cost cap'
         required: true
         type: choice
-        options: [gpt-6-luna, gpt-6.1-terra]
+        options: [gpt-6-luna]
         default: gpt-6-luna
       efforts:
         description: 'Comma-separated efforts'
@@ -104,22 +104,13 @@ jobs:
           [ "$SUITE" != provider-batch-live ] || { echo "::error::batch diagnostic requires a durable resumable receipt; use the local batch wrapper"; exit 1; }
           [ -z "$MAX_CASES" ] || printf '%s' "$MAX_CASES" | grep -Eq '^[1-9][0-9]{0,3}$' || { echo "::error::max_cases must be 1 to 9999 or empty"; exit 1; }
           [ -z "$CASES" ] || printf '%s' "$CASES" | grep -Eq '^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+){0,49}$' || { echo "::error::cases must be comma-separated case ids"; exit 1; }
-          case "$MODELS" in gpt-6-luna | gpt-6.1-terra) ;; *) echo "::error::select only gpt-6-luna or gpt-6.1-terra"; exit 1 ;; esac
+          case "$MODELS" in gpt-6-luna) ;; *) echo "::error::only priced gpt-6-luna is enabled"; exit 1 ;; esac
           case "$MODE" in live | record) ;; *) echo "::error::mode must be live or record"; exit 1 ;; esac
           case "$SPLIT" in dev | heldout | all) ;; *) echo "::error::bad split"; exit 1 ;; esac
           printf '%s' "$EFFORTS" | grep -Eq '^(low|medium|high|xhigh|max)(,(low|medium|high|xhigh|max)){0,4}$' || { echo "::error::bad efforts"; exit 1; }
           printf '%s' "$REPEATS" | grep -Eq '^[1-5]$' || { echo "::error::repeats must be 1 to 5"; exit 1; }
           printf '%s' "$MAX_COST" | grep -Eq '^[0-9]{1,2}(\.[0-9]{1,2})?$' || { echo "::error::max_cost_usd must be a number such as 2 or 0.50"; exit 1; }
           awk -v c="$MAX_COST" 'BEGIN { exit !(c > 0 && c <= 50) }' || { echo "::error::max_cost_usd must be above 0 and at most 50"; exit 1; }
-          if [ "$MODELS" = gpt-6.1-terra ]; then
-            [ -n "$SUITE" ] && [ "$SUITE" != provider-live ] && [ "$SUITE" != provider-batch-live ] &&
-              [ "$SPLIT" = dev ] && [ -n "$CASES" ] && [ "$REPEATS" = 1 ] &&
-              [[ "$MAX_CASES" =~ ^[1-3]$ ]] &&
-              [ "$(awk -F, '{print NF}' <<<"$CASES")" -le 3 ] &&
-              awk -v c="$MAX_COST" 'BEGIN { exit !(c <= 0.25) }' || {
-                echo "::error::Terra requires one explicit dev suite, one to three case ids, max_cases 1-3, one repeat and a USD 0.25 cap"; exit 1;
-              }
-          fi
       - name: Check out the private source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
