@@ -126,8 +126,16 @@ jobs:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ secrets.PRIVATE_REPO_PAT }}
           ref: ${{ inputs.branch }}
+          fetch-depth: 0
           # Only record mode pushes; a live run keeps no credential on disk.
           persist-credentials: ${{ inputs.mode == 'record' }}
+      - name: Require the OpenAI-only evaluation baseline
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor ba5a2c4f9134706509843e859688d89a4feac4a0 HEAD || {
+            echo '::error::source branch predates the OpenAI-only evaluation baseline; no provider request was sent'
+            exit 1
+          }
       - name: Rust toolchain (stable)
         run: rustup toolchain install stable --profile minimal --no-self-update
       - name: Cache the cargo registry and target directory

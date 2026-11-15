@@ -66,6 +66,13 @@ class OpenAiEvalsPolicy(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("durable resumable receipt", result.stdout)
 
+    def test_old_source_is_rejected_before_the_paid_step(self):
+        checkout = step("Check out the private source")
+        self.assertEqual(checkout["with"]["fetch-depth"], 0)
+        gate = step("Require the OpenAI-only evaluation baseline")
+        self.assertIn("git merge-base --is-ancestor ba5a2c4f9134706509843e859688d89a4feac4a0 HEAD", gate["run"])
+        self.assertLess(STEPS.index(gate), STEPS.index(step("Run the suites (OpenAI only; costs money)")))
+
     def test_missing_openai_key_exits_before_creating_report_or_running_binary(self):
         paid = step("Run the suites (OpenAI only; costs money)")
         bash = "C:/Program Files/Git/bin/bash.exe" if os.name == "nt" else shutil.which("bash")
