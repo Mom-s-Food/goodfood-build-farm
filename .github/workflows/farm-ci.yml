@@ -332,9 +332,15 @@ jobs:
           tool: cargo-deny@${{ env.CARGO_DENY_VERSION }},cargo-audit@${{ env.CARGO_AUDIT_VERSION }}
       - name: cargo-deny (policy in backend/deny.toml)
         run: cargo deny --manifest-path backend/Cargo.toml check
-      - name: cargo-audit (RUSTSEC-2023-0071 for rsa is accepted, see backend/deny.toml)
+      - name: cargo-audit (source-owned inactive-dependency guard when present)
         if: ${{ !cancelled() }}
-        run: cargo audit --file backend/Cargo.lock --ignore RUSTSEC-2023-0071
+        run: |
+          if test -f scripts/ci/audit_guard.py; then
+            python3 -I scripts/ci/audit_guard.py
+          else
+            # Historical source retains its original audit, without a SQLite exception.
+            cargo audit --file backend/Cargo.lock --ignore RUSTSEC-2023-0071
+          fi
 
   # Every check of the private ci.yml that is not Rust (its scripts, docs, deploy, infra,
   # contracts, workflows and secrets jobs) plus the farm's own. Each step runs even when an
