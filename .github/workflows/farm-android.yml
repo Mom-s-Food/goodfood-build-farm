@@ -43,12 +43,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: farm-android-${{ inputs.task || 'check' }}-${{ github.event.client_payload.source_ref || inputs.source_ref || inputs.branch || 'main' }}
+  group: farm-android-ksp-diagnostic-${{ inputs.task || 'check' }}-${{ github.event.client_payload.source_ref || inputs.source_ref || inputs.branch || 'main' }}
   cancel-in-progress: true
 
 env:
   PRIVATE_REPO: Mom-s-Food/goodfood-main
-  STATUS_CONTEXT: farm/android
+  STATUS_CONTEXT: farm/android-ksp-diagnostic
   TASK: ${{ inputs.task || 'check' }}
   GRADLE_OPTS: -Dorg.gradle.daemon=false
 
@@ -146,11 +146,42 @@ jobs:
         if: ${{ env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
         working-directory: android
         run: ./gradlew --continue checkModuleGraph ciFormat detektAll ciLint
+      - name: KSP evidence after static checks
+        if: ${{ !cancelled() && env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
+        working-directory: android
+        run: |
+          set -eu
+          jar=core/sync/build/intermediates/compile_library_classes_jar/debug/bundleLibCompileToJarDebug/classes.jar
+          if [ -f "$jar" ]; then
+            sha256sum "$jar"
+            jar tf "$jar" | grep -E '^app/goodfood/core/sync/(ConnectionStore|ImportStore|KitchenStore|CaptureStore)\.class$' || true
+          else echo 'sync compile jar missing'; fi
+          if [ -d feature/kitchen/build/kspCaches ]; then
+            find feature/kitchen/build/kspCaches -type f -printf '%P %s\n' | LC_ALL=C sort | sha256sum
+            find feature/kitchen/build/kspCaches -type f | wc -l
+            find feature/kitchen/build/kspCaches -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum | sha256sum
+          else echo 'kitchen KSP local state missing'; fi
       - name: Unit, Room and screenshot tests (T1, T2, T6)
         id: tests
         if: ${{ !cancelled() && env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
         working-directory: android
         run: ./gradlew --continue ciUnitTest ciScreenshots
+      - name: KSP evidence after tests
+        if: ${{ !cancelled() && env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
+        working-directory: android
+        run: |
+          set -eu
+          jar=core/sync/build/intermediates/compile_library_classes_jar/debug/bundleLibCompileToJarDebug/classes.jar
+          if [ -f "$jar" ]; then
+            sha256sum "$jar"
+            jar tf "$jar" | grep -E '^app/goodfood/core/sync/(ConnectionStore|ImportStore|KitchenStore|CaptureStore)\.class$' || true
+          else echo 'sync compile jar missing'; fi
+          if [ -d feature/kitchen/build/kspCaches ]; then
+            find feature/kitchen/build/kspCaches -type f -printf '%P %s\n' | LC_ALL=C sort | sha256sum
+            find feature/kitchen/build/kspCaches -type f | wc -l
+            find feature/kitchen/build/kspCaches -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum | sha256sum
+          else echo 'kitchen KSP local state missing'; fi
+          ./gradlew -q :feature:kitchen:dependencies --configuration debugCompileClasspath --no-daemon
       - name: Exported Room schemas and screenshots are committed
         if: ${{ !cancelled() && env.TASK == 'check' && steps.gate.outputs.run == 'true' }}
         run: |
