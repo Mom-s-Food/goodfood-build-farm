@@ -2,7 +2,8 @@
 # OpenAI only with the existing development key (OPENAI_API_KEY_DEV). Luna is the default;
 # Terra remains unavailable until pricing and its cap are verified. Every run costs money,
 # so it starts only by hand, one at a time, with a case cap
-# and a hard cost cap (`evals --max-cost-usd`: no call is sent once the run has spent that much).
+# and a spend threshold (`evals --max-cost-usd`: no new call starts once it is spent;
+# one in-flight call (including later chat steps) can exceed it at --parallel 1).
 #   live    score the suites live; the report goes to the run summary and an artifact; no commit
 #   record  the same calls, each answer written to backend/testdata/recordings and pushed to the
 #           given branch as one commit (never main), like farm-task.yml
@@ -19,7 +20,7 @@ on:
       branch:
         description: 'Reviewed commit or branch pointing to it (record mode requires a branch)'
         required: true
-        default: b514791672b988c8ba19a78394a80b94529d5a84
+        default: 114b40f1bf68f9db369d6b5b356221dcf0fca379
       mode:
         description: 'live (score only) or record (also commit the recordings to the branch)'
         required: true
@@ -59,7 +60,7 @@ on:
         required: true
         default: '1'
       max_cost_usd:
-        description: 'Hard cost cap of the run in USD (at most 50); the run stops before the next call once it is spent'
+        description: 'Spend threshold in USD (at most 50); one in-flight call can exceed it'
         required: true
         default: '2'
 
@@ -123,7 +124,7 @@ jobs:
       - name: Require the reviewed OpenAI evaluation source
         run: |
           set -euo pipefail
-          [ "$(git rev-parse HEAD)" = b514791672b988c8ba19a78394a80b94529d5a84 ] || {
+          [ "$(git rev-parse HEAD)" = 114b40f1bf68f9db369d6b5b356221dcf0fca379 ] || {
             echo '::error::source commit is not the reviewed OpenAI evaluation source; no provider request was sent'
             exit 1
           }
