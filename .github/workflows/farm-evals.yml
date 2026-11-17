@@ -19,7 +19,7 @@ on:
       branch:
         description: 'Reviewed commit or branch pointing to it (record mode requires a branch)'
         required: true
-        default: 4c0719d76c302c46c34cd928ea6ba63f22016954
+        default: b514791672b988c8ba19a78394a80b94529d5a84
       mode:
         description: 'live (score only) or record (also commit the recordings to the branch)'
         required: true
@@ -123,7 +123,7 @@ jobs:
       - name: Require the reviewed OpenAI evaluation source
         run: |
           set -euo pipefail
-          [ "$(git rev-parse HEAD)" = 4c0719d76c302c46c34cd928ea6ba63f22016954 ] || {
+          [ "$(git rev-parse HEAD)" = b514791672b988c8ba19a78394a80b94529d5a84 ] || {
             echo '::error::source commit is not the reviewed OpenAI evaluation source; no provider request was sent'
             exit 1
           }
