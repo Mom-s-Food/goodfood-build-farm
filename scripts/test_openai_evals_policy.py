@@ -64,8 +64,19 @@ class OpenAiEvalsPolicy(unittest.TestCase):
         checkout = step("Check out the private source")
         self.assertEqual(checkout["with"]["fetch-depth"], 0)
         gate = step("Require the reviewed OpenAI evaluation source")
-        self.assertIn("99b128cd515985c9cf0068629d052306d542e725", gate["run"])
-        self.assertIn('$(git rev-parse HEAD)', gate["run"])
+        reviewed = "4c0719d76c302c46c34cd928ea6ba63f22016954"
+        triggers = WORKFLOW.get("on", WORKFLOW.get(True))
+        self.assertEqual(triggers["workflow_dispatch"]["inputs"]["branch"]["default"], reviewed)
+        bash = "C:/Program Files/Git/bin/bash.exe" if os.name == "nt" else shutil.which("bash")
+        script = 'git() { printf "%s\\n" "$TEST_SOURCE"; }\n' + gate["run"]
+        for source, allowed in ((reviewed, True),
+                                ("99b128cd515985c9cf0068629d052306d542e725", False),
+                                ("0" * 40, False)):
+            with self.subTest(source=source):
+                result = subprocess.run([bash, "-c", script],
+                                        env=dict(os.environ, TEST_SOURCE=source),
+                                        text=True, capture_output=True)
+                self.assertEqual(result.returncode == 0, allowed)
         self.assertLess(STEPS.index(gate), STEPS.index(step("Run the suites (OpenAI only; costs money)")))
 
     def test_missing_openai_key_exits_before_creating_report_or_running_binary(self):
