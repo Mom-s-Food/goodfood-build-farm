@@ -125,7 +125,8 @@ jobs:
             probe_started=$(date +%s)
             rm -f probe-result/one.json
             echo "::group::probe $n at $(now_iso)"
-            if bash scripts/validation/probe.sh --env staging --result probe-result/one.json; then ok=true; else ok=false; fi
+            # Preserve time for handover even if the probe stalls.
+            if timeout 180s bash scripts/validation/probe.sh --env staging --result probe-result/one.json; then ok=true; else ok=false; fi
             echo "::endgroup::"
             [ -s probe-result/one.json ] || jq -n --arg at "$(now_iso)" '{at: $at, steps: []}' > probe-result/one.json
             jq -c --argjson ok "$ok" --argjson run "$RUN_ID" --argjson seq "$n" '. + {ok: $ok, run: $run, seq: $seq}' probe-result/one.json >> "$out"
@@ -141,6 +142,7 @@ jobs:
             [ "$n" -lt "$max" ] || break
             now=$(date +%s); next=$((probe_started + 300))
             [ "$next" -lt "$end" ] || break
+            [ "$now" -lt "$end" ] || break
             if [ "$next" -gt "$now" ]; then sleep $((next - now)); fi
           done
           { echo "last_ok=$prev"; echo "failed_two=$failed_two"; echo "count=$n"; } >> "$GITHUB_OUTPUT"

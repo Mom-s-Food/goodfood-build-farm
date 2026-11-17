@@ -23,6 +23,7 @@ MOCKS = r'''
 date() { if [ "$1" = "+%s" ]; then cat clock; else printf '2026-01-01T00:00:00Z\n'; fi; }
 sleep() { echo "$1" >> sleeps; echo $(( $(cat clock) + $1 )) > clock; }
 jq() { echo '{}'; }
+timeout() { shift; "$@"; }
 bash() {
   echo "$(cat clock)" >> starts
   echo '{}' > probe-result/one.json
@@ -67,6 +68,11 @@ class ProbeCadence(unittest.TestCase):
     def test_slow_probe_does_not_cause_negative_sleep(self):
         starts, _ = self.run_loop(probes="2", duration=310)
         self.assertEqual(starts, [299, 609])
+
+    def test_probe_past_chain_deadline_does_not_start_another(self):
+        starts, output = self.run_loop(duration=700)
+        self.assertEqual(starts, [299])
+        self.assertIn("count=1", output)
 
 
 if __name__ == "__main__":
