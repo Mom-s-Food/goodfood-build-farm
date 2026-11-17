@@ -7,8 +7,8 @@
 # this file had from 2026-10-31 03:01Z started no run in over two hours (the workflow
 # active, on the default branch, YAML parsed), and the private repository's daily 07:17
 # schedule started 5 to 7 hours late every day (2026-10-25..29). So the clock is this
-# workflow itself: one run holds one runner for about 5 h 40 min, probes at every
-# 5-minute mark of the clock, then dispatches its successor (workflow_dispatch from
+# workflow itself: one run holds one runner for about 5 h 40 min, probes at least
+# 5 minutes apart, then dispatches its successor (workflow_dispatch from
 # GITHUB_TOKEN does start a run) and ends; the successor waits in the farm-probe group
 # and starts within a minute or two. The hourly schedule is only a backstop that restarts
 # a broken chain; when a chain run is alive, the backstop run waits in the group and the
@@ -114,14 +114,19 @@ jobs:
           }
           [ -f scripts/validation/probe.sh ] || skip "scripts/validation/probe.sh is not on the chosen commit"
           [ -n "$QA_SIGNIN_KEY" ] || skip "the QA_SIGNIN_KEY farm secret is not set (B9 decision 2)"
+          # A successor inherits the previous result. Wait before probing again so
+          # persistent failures cannot dispatch a new failing run every few seconds.
+          if [ -z "$PROBES" ] && [ -n "$LAST_OK" ]; then sleep 300; fi
           start=$(date +%s)
           if [ -n "$PROBES" ]; then max=$PROBES; end=$((start + 300 * PROBES + 60)); else max=100000; end=$((start + RUN_MINUTES * 60)); fi
           prev="$LAST_OK" n=0 failed_two=false
           while :; do
             n=$((n + 1))
+            probe_started=$(date +%s)
             rm -f probe-result/one.json
             echo "::group::probe $n at $(now_iso)"
-            if bash scripts/validation/probe.sh --env staging --result probe-result/one.json; then ok=true; else ok=false; fi
+            # Preserve time for handover even if the probe stalls.
+            if timeout 180s bash scripts/validation/probe.sh --env staging --result probe-result/one.json; then ok=true; else ok=false; fi
             echo "::endgroup::"
             [ -s probe-result/one.json ] || jq -n --arg at "$(now_iso)" '{at: $at, steps: []}' > probe-result/one.json
             jq -c --argjson ok "$ok" --argjson run "$RUN_ID" --argjson seq "$n" '. + {ok: $ok, run: $run, seq: $seq}' probe-result/one.json >> "$out"
@@ -135,9 +140,10 @@ jobs:
             fi
             prev=$ok
             [ "$n" -lt "$max" ] || break
-            now=$(date +%s); next=$(( (now / 300 + 1) * 300 ))
+            now=$(date +%s); next=$((probe_started + 300))
             [ "$next" -lt "$end" ] || break
-            sleep $((next - now))
+            [ "$now" -lt "$end" ] || break
+            if [ "$next" -gt "$now" ]; then sleep $((next - now)); fi
           done
           { echo "last_ok=$prev"; echo "failed_two=$failed_two"; echo "count=$n"; } >> "$GITHUB_OUTPUT"
           echo "$n probes; last ok=$prev"
