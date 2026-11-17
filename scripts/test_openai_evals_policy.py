@@ -64,13 +64,13 @@ class OpenAiEvalsPolicy(unittest.TestCase):
         checkout = step("Check out the private source")
         self.assertEqual(checkout["with"]["fetch-depth"], 0)
         gate = step("Require the reviewed OpenAI evaluation source")
-        reviewed = "4c0719d76c302c46c34cd928ea6ba63f22016954"
+        reviewed = "b514791672b988c8ba19a78394a80b94529d5a84"
         triggers = WORKFLOW.get("on", WORKFLOW.get(True))
         self.assertEqual(triggers["workflow_dispatch"]["inputs"]["branch"]["default"], reviewed)
         bash = "C:/Program Files/Git/bin/bash.exe" if os.name == "nt" else shutil.which("bash")
         script = 'git() { printf "%s\\n" "$TEST_SOURCE"; }\n' + gate["run"]
         for source, allowed in ((reviewed, True),
-                                ("99b128cd515985c9cf0068629d052306d542e725", False),
+                                ("4c0719d76c302c46c34cd928ea6ba63f22016954", False),
                                 ("0" * 40, False)):
             with self.subTest(source=source):
                 result = subprocess.run([bash, "-c", script],
