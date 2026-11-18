@@ -78,6 +78,15 @@ class OpenAiEvalsPolicy(unittest.TestCase):
         self.assertIn('args+=(--suite meal-text --diagnostic-meal-history)', paid)
         self.assertIn('args+=(--suite "$SUITE")', paid)
 
+    def test_history_diagnostic_cannot_omit_or_repeat_selected_cases(self):
+        valid = dict(SUITE="meal-history-attribution", SPLIT="dev", MODE="live", MAX_COST="0.02")
+        cases = "dev428-0001,dev428-0002,dev428-0003,dev428-0004"
+        self.assertNotEqual(self.validate(**valid, CASES=cases).returncode, 0)
+        self.assertEqual(self.validate(**valid, CASES=cases, MAX_CASES="4").returncode, 0)
+        self.assertEqual(self.validate(**valid, CASES=cases, MAX_CASES="").returncode, 0)
+        self.assertNotEqual(self.validate(**valid, CASES="dev428-0003,dev428-0003").returncode, 0)
+        self.assertEqual(self.validate(SUITE="meal-text", CASES=cases).returncode, 0)
+
     def test_old_source_is_rejected_before_the_paid_step(self):
         checkout = step("Check out the private source")
         self.assertEqual(checkout["with"]["fetch-depth"], 0)

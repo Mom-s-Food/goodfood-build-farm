@@ -119,6 +119,19 @@ jobs:
               echo '::error::history diagnostic requires explicit dev428 cases, live dev, low effort, one repeat and a spend threshold at most USD 0.05'
               exit 1
             fi
+            IFS=, read -r -a history_cases <<< "$CASES"
+            declare -A seen_history_cases=()
+            for case_id in "${history_cases[@]}"; do
+              if [[ -v 'seen_history_cases[$case_id]' ]]; then
+                echo '::error::history diagnostic case IDs must be unique'
+                exit 1
+              fi
+              seen_history_cases[$case_id]=1
+            done
+            if [ -n "$MAX_CASES" ] && [ "$MAX_CASES" -lt "${#history_cases[@]}" ]; then
+              echo '::error::history diagnostic max_cases must cover all explicit case IDs or be empty'
+              exit 1
+            fi
           fi
       - name: Check out the private source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
