@@ -64,7 +64,7 @@ class OpenAiEvalsPolicy(unittest.TestCase):
         checkout = step("Check out the private source")
         self.assertEqual(checkout["with"]["fetch-depth"], 0)
         gate = step("Require the reviewed OpenAI evaluation source")
-        reviewed = "114b40f1bf68f9db369d6b5b356221dcf0fca379"
+        reviewed = "269555ffa8cd92c9608ddb0b345fbb75e78a9f63"
         triggers = WORKFLOW.get("on", WORKFLOW.get(True))
         self.assertEqual(triggers["workflow_dispatch"]["inputs"]["branch"]["default"], reviewed)
         bash = "C:/Program Files/Git/bin/bash.exe" if os.name == "nt" else shutil.which("bash")
