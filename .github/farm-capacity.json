@@ -22,7 +22,7 @@
       "group": "farm-perf"
     },
     "farm-replay": {
-      "group": "farm-replay-${{ inputs.mode || 'replay' }}",
+      "group": "farm-replay-${{ inputs.mode == 'android' && 'record' || inputs.mode || 'replay' }}",
       "groups": 2
     },
     "farm-synthetic": {

@@ -12,6 +12,7 @@ and works on one pinned commit.
 | `farm-android.yml` | `repository_dispatch: trigger-ci` (with farm-ci), or by hand with a commit SHA or `task=record` and a branch | The Android checks (goodfood-main A1): module graph, ktlint, detekt, Android Lint, unit and Room tests, Roborazzi screenshots with accessibility checks, committed Room schemas, the 30 MB download budget. Runs only when the commit changes `android/`, `contracts/`, `design/tokens/` or `tests/fixtures/sync/`; reports `farm/android` on the private commit, never `farm/ci`. `task=record` formats, exports the Room schemas and records the screenshot baselines on this Linux runner and pushes them to the branch (never `main`) as one commit that changes only `android/`. |
 | `farm-ios.yml` | `repository_dispatch: trigger-ci` (with farm-ci), or by hand with a commit SHA or `task=record` and a branch | The iOS checks (goodfood-main I1) on one `macos-26` job, all through `ios/scripts/ci.sh`: swift-format and SwiftLint, the XcodeGen project with the committed `Package.resolved` pins, an unsigned simulator build, Swift Testing (T1, T2 on GRDB) and snapshot tests, and the Maestro smoke journeys against the contract mock server. Runs only when the commit changes `ios/`, `contracts/{openapi,analytics,fixtures}/`, `design/tokens/`, `tests/fixtures/sync/` or `tests/mobile-e2e/{ios,shared}/`; reports `farm/ios` on the private commit, never `farm/ci`. `task=record` formats, resolves `Package.resolved` and records the snapshot baselines on the same runner and pushes them to the branch (never `main`) as one commit that changes only `ios/`. |
 | `farm-build.yml` | `repository_dispatch: trigger-build`, or by hand | Builds the `api` and `worker` images (arm64, for the OCI Ampere nodes) and pushes them to `ghcr.io/mom-s-food/goodfood-main/{api,worker}:<sha>`; uploads a release receipt with each digest. It never deploys. |
+| `farm-replay.yml` | Nightly on `main` and by hand | Replays the committed contract archives or records a new synthetic archive. Android recording runs the mock APK against a local simulated stack and delivers the verified archive privately. |
 | `farm-evals.yml` | By hand: `branch`, `mode` (`live` or `record`), `suite`, case and cost caps | OpenAI only, Luna by default with a Luna rubric judge. Terra remains disabled until pricing and its cap are verified. `record` writes each answer to `backend/testdata/recordings/` and pushes one commit to the branch (never `main`). |
 | `farm-task.yml` | By hand: `branch` (never `main`), `task`, optional `suite` | One file-writing cargo task, pushed to the branch as one commit: `gen-cases` (the eval case generator; commits `evals/`), `write-recordings` (the synthetic recordings of the held-out split on the default grid, no key and no model call; commits `backend/testdata/recordings/` and `evals/`) or `fmt` (`cargo fmt --all`; commits `backend/`). A task that changes anything outside its paths fails and pushes nothing. |
 | `farm-zap.yml` | Nightly (02:40 UTC) on `main`, or by hand with a commit SHA | Lane T9: `scripts/test/security-scan.sh --dast --env staging`, the OWASP ZAP API scan of staging from the contract (ZAP pinned by digest in that script), signed in as a fresh synthetic user that is deleted afterwards. The log shows only alert counts per level (`--public-log`: no alert names, plugin ids, URLs or ZAP output), and the `zap-report-<run>` artifact holds only `zap-reports.tar.gz.age`, the JSON and HTML reports and ZAP's output encrypted with `age` to the owner's public key in the `ZAP_REPORT_AGE_RECIPIENT` repository variable (none kept until it exists); a High-risk alert fails the run unless `tests/security/zap/rules.tsv` says otherwise. Needs the `QA_SIGNIN_KEY` secret (B9 decision 2); until it exists the run warns and scans nothing. Never scans production. |
@@ -41,6 +42,27 @@ gh release download "$private_release_tag" -R Mom-s-Food/goodfood-main --dir "$p
 The tag is `android-staging-debug-<source-prefix>-<run-id>-<attempt>`, also printed in the run summary.
 Remove the temporary private draft release after the test build has been verified. The debug signing
 key cache supports updates between farm-built test APKs while that cache is available.
+
+## Android contract replay
+
+Dispatch `farm-replay.yml` with `mode=android`, an exact GoodFood source SHA, and a new
+`android-X.Y.Z` archive name. The mock emulator runs the local typed-meal journey through the
+recording proxy, including the source runner's pending-capture recovery follow-up. The contract
+recorder checks the new archive by replaying it once. The API and worker must both use simulated
+AI on the local stack.
+
+```bash
+gh workflow run farm-replay.yml -R Mom-s-Food/goodfood-build-farm \
+  -f mode=android -f source_ref="$(git -C ../goodfood-main rev-parse HEAD)" \
+  -f archive="$archive_name"
+gh release download "$private_release_tag" -R Mom-s-Food/goodfood-main --dir "$archive_dir"
+(cd "$archive_dir" && sha256sum -c SHA256SUMS)
+```
+
+The public run summary shows the pinned source and the private draft release tag. The release
+contains a checksummed archive with only its manifest and exchanges. The APK, screenshots,
+device and build logs stay on the runner. Review the extracted archive before committing it under
+`tests/contract/releases/` and remove its temporary draft release once reviewed.
 
 ## Job budget
 

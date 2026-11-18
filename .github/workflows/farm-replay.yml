@@ -6,6 +6,9 @@
 #   record: records the T4 journeys through the recording proxy into a new synthetic archive
 #           (tests/contract/replay/cmd/record), replays it once, and keeps it as a one-day
 #           artifact for review before it is committed.
+#   android: records and replays the typed-meal journey from a mock APK on an emulator
+#            against the simulated local stack. The verified archive goes to a draft release
+#            in the private source repository.
 #
 # Logs and artifacts of a public repository are public. Everything here is synthetic: the
 # local stack's throwaway database, synthetic users, no model key (AI_MODE=simulated) and no
@@ -22,16 +25,16 @@ on:
         required: false
         default: ''
       mode:
-        description: 'replay the committed archives, or record a new synthetic archive'
+        description: 'Replay committed archives, record T4, or record the Android mock journey'
         type: choice
-        options: [replay, record]
+        options: [replay, record, android]
         default: replay
       journeys:
         description: 'record: comma-separated T4 journey names, or all'
         required: false
         default: all
       archive:
-        description: 'record: the archive name, <platform>-<version>'
+        description: 'record: <platform>-<version>; android: required, android-<version>'
         required: false
         default: synthetic-0.0.0
   schedule:
@@ -43,10 +46,8 @@ permissions:
   contents: read
 
 concurrency:
-  # One replay (per mode) run at a time on the whole farm (a newer dispatch replaces the queued one, a
-  # running one is never cancelled): the free plan has 20 concurrent jobs and farm-ci needs most of
-  # them. .github/farm-capacity.json budgets every workflow; scripts/check-farm-workflows.py checks it.
-  group: farm-replay-${{ inputs.mode || 'replay' }}
+  # Both record modes share one slot. Scheduled archive replay keeps its existing slot.
+  group: farm-replay-${{ inputs.mode == 'android' && 'record' || inputs.mode || 'replay' }}
   cancel-in-progress: false
 
 env:
@@ -60,6 +61,7 @@ jobs:
     steps:
       - name: Validate the request
         env:
+          MODE: ${{ inputs.mode || 'replay' }}
           REQUESTED: ${{ inputs.source_ref }}
           JOURNEYS: ${{ inputs.journeys }}
           ARCHIVE: ${{ inputs.archive }}
@@ -74,6 +76,14 @@ jobs:
           if [ -n "$ARCHIVE" ] && ! printf '%s' "$ARCHIVE" | grep -Eq '^(android|ios|synthetic)-[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "::error::archive must be <android|ios|synthetic>-X.Y.Z"; exit 1
           fi
+          if [ "$MODE" = android ]; then
+            if [ -z "$REQUESTED" ]; then
+              echo "::error::source_ref is required for Android replay"; exit 1
+            fi
+            if ! printf '%s' "$ARCHIVE" | grep -Eq '^android-[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::Android replay requires archive=android-X.Y.Z"; exit 1
+            fi
+          fi
       - name: Check out the private source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -83,13 +93,38 @@ jobs:
           persist-credentials: false
       - name: Pin the exact commit
         id: pin
+        env:
+          REQUESTED: ${{ inputs.source_ref }}
         run: |
-          printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "goodfood-main $(git rev-parse HEAD)"
+          set -euo pipefail
+          resolved="$(git rev-parse HEAD)"
+          if [ -n "$REQUESTED" ] && ! [ "$resolved" = "$REQUESTED" ]; then
+            echo "::error::source checkout does not match source_ref"; exit 1
+          fi
+          printf 'sha=%s\n' "$resolved" >> "$GITHUB_OUTPUT"
+          echo "goodfood-main $resolved"
+      - name: Require the simulated local stack
+        if: ${{ inputs.mode == 'android' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          if ! docker compose -f infra/compose/dev.yml config --format json 2>"$RUNNER_TEMP/android-replay-compose.log" |
+            python3 -c '
+          import json, sys
+
+          services = json.load(sys.stdin)["services"]
+          for service in ("api", "worker"):
+              env = services[service]["environment"]
+              if env.get("ENV") != "local" or env.get("AI_MODE") != "simulated":
+                  sys.exit(1)
+          ' 2>>"$RUNNER_TEMP/android-replay-compose.log"; then
+            echo "::error::Android replay requires a local API and worker in simulated mode"; exit 1
+          fi
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       # The two images the compose file names, from backend/Dockerfile; the cargo-chef
       # dependency layer is cached between runs (GitHub Actions cache, this workflow's scope).
       - name: Build the api image
+        if: ${{ inputs.mode != 'android' }}
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -102,6 +137,7 @@ jobs:
           cache-from: type=gha,scope=farm-replay
           cache-to: type=gha,scope=farm-replay,mode=max
       - name: Build the worker image
+        if: ${{ inputs.mode != 'android' }}
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -112,8 +148,29 @@ jobs:
           load: true
           push: false
           cache-from: type=gha,scope=farm-replay
+      - name: Build the Android replay stack
+        if: ${{ inputs.mode == 'android' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          for image in api worker; do
+            if ! docker buildx build --file backend/Dockerfile --target "$image" \
+              --build-arg SERVER_VERSION=local --tag "goodfood-$image:local" --load . \
+              > "$RUNNER_TEMP/android-replay-$image.log" 2>&1; then
+              echo "::error::Android replay local stack build failed"; exit 1
+            fi
+          done
       - name: Start the local stack
+        if: ${{ inputs.mode != 'android' }}
         run: scripts/dev/up.sh --no-build
+      - name: Start the Android replay stack
+        if: ${{ inputs.mode == 'android' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          if ! scripts/dev/up.sh --no-build > "$RUNNER_TEMP/android-replay-stack.log" 2>&1; then
+            echo "::error::Android replay local stack did not become ready"; exit 1
+          fi
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: tests/go.mod
@@ -144,6 +201,91 @@ jobs:
           path: ${{ runner.temp }}/archive
           retention-days: 1
           if-no-files-found: warn
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        if: ${{ inputs.mode == 'android' }}
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Build the mock flavor
+        if: ${{ inputs.mode == 'android' }}
+        working-directory: android
+        run: |
+          set -euo pipefail
+          umask 077
+          if ! ./gradlew --no-daemon :app:assembleMockDebug > "$RUNNER_TEMP/android-replay-build.log" 2>&1; then
+            echo "::error::Android replay mock build failed"; exit 1
+          fi
+      - name: Start the emulator and install the pinned Maestro
+        if: ${{ inputs.mode == 'android' }}
+        env:
+          MAESTRO_VERSION: 2.11.0
+          MAESTRO_SHA256: 5384593cb4e7a106489e75a821d157dd43f4e438df6bc308b72e82c685e1283a
+        run: |
+          set -euo pipefail
+          umask 077
+          exec 3>&1
+          exec > "$RUNNER_TEMP/android-replay-tools.log" 2>&1
+          trap 'echo "::error::Android replay emulator or Maestro setup failed" >&3' ERR
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/maestro.zip" \
+            "https://github.com/mobile-dev-inc/maestro/releases/download/cli-$MAESTRO_VERSION/maestro.zip"
+          echo "$MAESTRO_SHA256  $RUNNER_TEMP/maestro.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/maestro.zip" -d "$RUNNER_TEMP"
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          export PATH="$ANDROID_HOME/platform-tools:$PATH"
+          bash scripts/test/android-emulator.sh "$RUNNER_TEMP/android-replay-emulator.log"
+          printf '%s\n' "$RUNNER_TEMP/maestro/bin" "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+      - name: Record and replay the Android journey
+        if: ${{ inputs.mode == 'android' }}
+        working-directory: tests
+        env:
+          ARCHIVE: ${{ inputs.archive }}
+          SHA: ${{ steps.pin.outputs.sha }}
+          MAESTRO_CLI_NO_ANALYTICS: '1'
+          MAESTRO_CLI_ANALYSIS_NOTIFICATION_DISABLED: 'true'
+        run: |
+          set -euo pipefail
+          umask 077
+          if ! go run ./contract/replay/cmd/record -target http://127.0.0.1:8080 -listen 127.0.0.1:4010 \
+            -out "$RUNNER_TEMP/android-replay-archive/$ARCHIVE" -journeys AndroidT7 \
+            -source "Mock Android T7 through a local simulated stack, from goodfood-main $SHA" \
+            -command 'bash ../scripts/test/android-journeys.sh --local http://127.0.0.1:4010 --apk ../android/app/build/outputs/apk/mock/debug/app-mock-debug.apk --out "$RUNNER_TEMP/android-replay-journeys" --flow log-typed-meal' \
+            > "$RUNNER_TEMP/android-replay-recorder.log" 2>&1; then
+            echo "::error::Android journey recording or archive verification failed"; exit 1
+          fi
+      - name: Deliver the Android archive privately
+        if: ${{ inputs.mode == 'android' }}
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
+          ARCHIVE: ${{ inputs.archive }}
+          SHA: ${{ steps.pin.outputs.sha }}
+        run: |
+          set -euo pipefail
+          umask 077
+          readonly repository=Mom-s-Food/goodfood-main
+          if [ "$(gh api "repos/$repository" --jq '.private' 2>"$RUNNER_TEMP/android-replay-delivery.log")" != true ]; then
+            echo "::error::Android replay destination must be private"; exit 1
+          fi
+          cd "$RUNNER_TEMP/android-replay-archive"
+          if [ -L "$ARCHIVE" ]; then
+            echo "::error::Android replay archive path is not a directory"; exit 1
+          fi
+          for file in "$ARCHIVE/manifest.json" "$ARCHIVE/exchanges.jsonl"; do
+            if [ ! -s "$file" ] || [ -L "$file" ]; then
+              echo "::error::Android replay archive is incomplete"; exit 1
+            fi
+          done
+          bundle="$ARCHIVE.tar.gz"
+          tar -czf "$bundle" -- "$ARCHIVE/manifest.json" "$ARCHIVE/exchanges.jsonl"
+          sha256sum "$bundle" > SHA256SUMS
+          tag="android-replay-${SHA:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if ! gh release create "$tag" --repo "$repository" --draft --target "$SHA" --title "$tag" \
+            "$bundle" SHA256SUMS >> "$RUNNER_TEMP/android-replay-delivery.log" 2>&1; then
+            echo "::error::Android replay private delivery failed"; exit 1
+          fi
+          printf 'Android replay verified at `%s`. Private draft release `%s` in `%s`.\n' \
+            "$SHA" "$tag" "$repository" >> "$GITHUB_STEP_SUMMARY"
       - name: Stack status
-        if: ${{ failure() }}
+        if: ${{ failure() && inputs.mode != 'android' }}
         run: docker compose -f infra/compose/dev.yml ps || true
