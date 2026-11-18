@@ -60,11 +60,38 @@ class OpenAiEvalsPolicy(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("durable resumable receipt", result.stdout)
 
+    def test_history_diagnostic_requires_the_frozen_development_scope(self):
+        valid = dict(SUITE="meal-history-attribution", SPLIT="dev", CASES="dev428-0003,dev428-0006",
+                     MODE="live", EFFORTS="low", REPEATS="1", MAX_COST="0.02")
+        self.assertEqual(self.validate(**valid).returncode, 0)
+        for invalid in (dict(SPLIT="heldout"), dict(SPLIT="all"), dict(MODE="record", BRANCH="example"),
+                        dict(CASES=""), dict(CASES="dev428-0000"), dict(CASES="mt-0001"),
+                        dict(EFFORTS="medium"), dict(REPEATS="2"), dict(MAX_COST="0.06")):
+            with self.subTest(invalid=invalid):
+                result = self.validate(**(valid | invalid))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("history diagnostic", result.stdout)
+
+    def test_history_selector_forwards_only_the_scoped_runtime_flag(self):
+        paid = step("Run the suites (OpenAI only; costs money)")["run"]
+        self.assertIn('if [ "$SUITE" = meal-history-attribution ]; then', paid)
+        self.assertIn('args+=(--suite meal-text --diagnostic-meal-history)', paid)
+        self.assertIn('args+=(--suite "$SUITE")', paid)
+
+    def test_history_diagnostic_cannot_omit_or_repeat_selected_cases(self):
+        valid = dict(SUITE="meal-history-attribution", SPLIT="dev", MODE="live", MAX_COST="0.02")
+        cases = "dev428-0001,dev428-0002,dev428-0003,dev428-0004"
+        self.assertNotEqual(self.validate(**valid, CASES=cases).returncode, 0)
+        self.assertEqual(self.validate(**valid, CASES=cases, MAX_CASES="4").returncode, 0)
+        self.assertEqual(self.validate(**valid, CASES=cases, MAX_CASES="").returncode, 0)
+        self.assertNotEqual(self.validate(**valid, CASES="dev428-0003,dev428-0003").returncode, 0)
+        self.assertEqual(self.validate(SUITE="meal-text", CASES=cases).returncode, 0)
+
     def test_old_source_is_rejected_before_the_paid_step(self):
         checkout = step("Check out the private source")
         self.assertEqual(checkout["with"]["fetch-depth"], 0)
         gate = step("Require the reviewed OpenAI evaluation source")
-        reviewed = "b75c27102d6040fed6e6e104e24479012f4d0a7e"
+        reviewed = "29afc1218709e01db33eafe2ce03cb3f1571af6f"
         triggers = WORKFLOW.get("on", WORKFLOW.get(True))
         self.assertEqual(triggers["workflow_dispatch"]["inputs"]["branch"]["default"], reviewed)
         bash = "C:/Program Files/Git/bin/bash.exe" if os.name == "nt" else shutil.which("bash")

@@ -20,7 +20,7 @@ on:
       branch:
         description: 'Reviewed commit or branch pointing to it (record mode requires a branch)'
         required: true
-        default: b75c27102d6040fed6e6e104e24479012f4d0a7e
+        default: 29afc1218709e01db33eafe2ce03cb3f1571af6f
       mode:
         description: 'live (score only) or record (also commit the recordings to the branch)'
         required: true
@@ -28,7 +28,7 @@ on:
         options: [live, record]
         default: live
       suite:
-        description: 'One suite name; empty runs every suite that has a runner'
+        description: 'One suite, or meal-history-attribution for the explicit development diagnostic'
         required: false
         default: ''
       max_cases:
@@ -112,6 +112,27 @@ jobs:
           printf '%s' "$REPEATS" | grep -Eq '^[1-5]$' || { echo "::error::repeats must be 1 to 5"; exit 1; }
           printf '%s' "$MAX_COST" | grep -Eq '^[0-9]{1,2}(\.[0-9]{1,2})?$' || { echo "::error::max_cost_usd must be a number such as 2 or 0.50"; exit 1; }
           awk -v c="$MAX_COST" 'BEGIN { exit !(c > 0 && c <= 50) }' || { echo "::error::max_cost_usd must be above 0 and at most 50"; exit 1; }
+          if [ "$SUITE" = meal-history-attribution ]; then
+            if [ "$MODE" != live ] || [ "$SPLIT" != dev ] || [ "$EFFORTS" != low ] || [ "$REPEATS" != 1 ] ||
+               ! printf '%s' "$CASES" | grep -Eq '^dev428-000[1-8](,dev428-000[1-8]){0,7}$' ||
+               ! awk -v c="$MAX_COST" 'BEGIN { exit !(c <= 0.05) }'; then
+              echo '::error::history diagnostic requires explicit dev428 cases, live dev, low effort, one repeat and a spend threshold at most USD 0.05'
+              exit 1
+            fi
+            IFS=, read -r -a history_cases <<< "$CASES"
+            declare -A seen_history_cases=()
+            for case_id in "${history_cases[@]}"; do
+              if [[ -v 'seen_history_cases[$case_id]' ]]; then
+                echo '::error::history diagnostic case IDs must be unique'
+                exit 1
+              fi
+              seen_history_cases[$case_id]=1
+            done
+            if [ -n "$MAX_CASES" ] && [ "$MAX_CASES" -lt "${#history_cases[@]}" ]; then
+              echo '::error::history diagnostic max_cases must cover all explicit case IDs or be empty'
+              exit 1
+            fi
+          fi
       - name: Check out the private source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -124,7 +145,7 @@ jobs:
       - name: Require the reviewed OpenAI evaluation source
         run: |
           set -euo pipefail
-          [ "$(git rev-parse HEAD)" = b75c27102d6040fed6e6e104e24479012f4d0a7e ] || {
+          [ "$(git rev-parse HEAD)" = 29afc1218709e01db33eafe2ce03cb3f1571af6f ] || {
             echo '::error::source commit is not the reviewed OpenAI evaluation source; no provider request was sent'
             exit 1
           }
@@ -171,7 +192,11 @@ jobs:
           args=(--root ../evals --run --mode "$MODE" --split "$SPLIT" --models "openai:$MODELS" --efforts "$EFFORTS"
                 --judge-model gpt-6-luna --judge-effort low --parallel 1
                 --repeats "$REPEATS" --max-cost-usd "$MAX_COST" --json "$out/report.json")
-          [ -z "$SUITE" ] || args+=(--suite "$SUITE")
+          if [ "$SUITE" = meal-history-attribution ]; then
+            args+=(--suite meal-text --diagnostic-meal-history)
+          elif [ -n "$SUITE" ]; then
+            args+=(--suite "$SUITE")
+          fi
           [ -z "$MAX_CASES" ] || args+=(--max-cases "$MAX_CASES")
           [ -z "$CASES" ] || args+=(--cases "$CASES")
           printf 'evals %s\nsource %s at %s\n' "${args[*]}" "$BRANCH" "$(git rev-parse HEAD)" > "$out/command.txt"
@@ -181,7 +206,7 @@ jobs:
           set -e
           echo "code=$code" >> "$GITHUB_OUTPUT"
           echo "exit code $code" >> "$out/command.txt"
-          # Scores, counts, tokens and cost only (no prompt, case or answer text): safe to print.
+          # Aggregate metrics and allowlisted diagnostic categories. Never print prompts or responses.
           cat "$out/command.txt" "$out/report.txt" "$out/stderr.txt"
           {
             echo "### farm-evals: $MODE on \`$BRANCH\` ($(git rev-parse --short HEAD)), exit $code"
