@@ -21,7 +21,7 @@ on:
   workflow_dispatch:
     inputs:
       run:
-        description: 'Optional go test -run pattern (for example TestTimeZone); empty runs every journey'
+        description: 'Optional test-name regex (for example TestTimeZone); empty runs every journey'
         required: false
         default: ''
 
@@ -47,7 +47,7 @@ jobs:
           RUN: ${{ inputs.run }}
         run: |
           set -euo pipefail
-          [ -z "$RUN" ] || printf '%s' "$RUN" | grep -Eq '^[A-Za-z0-9_|^$/.-]{1,120}$' || { echo "::error::run must be a go test -run pattern"; exit 1; }
+          [ -z "$RUN" ] || printf '%s' "$RUN" | grep -Eq '^[A-Za-z0-9_|^$/.-]{1,120}$' || { echo "::error::run must be a test-name regex"; exit 1; }
       - name: Check out the private source (main, what staging runs)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -55,7 +55,11 @@ jobs:
           token: ${{ secrets.PRIVATE_REPO_PAT }}
           ref: main
           persist-credentials: false
+      - name: Rust toolchain for standalone suites
+        if: ${{ hashFiles('tests/api-e2e/Cargo.toml') != '' }}
+        run: rustup toolchain install stable --profile minimal --no-self-update
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: ${{ hashFiles('tests/go.mod') != '' }}
         with:
           go-version-file: tests/go.mod
           cache: false
@@ -83,9 +87,14 @@ jobs:
           else
             key=present
           fi
-          args=(-count=1 -json -timeout 30m)
-          [ -z "$RUN" ] || args+=(-run "$RUN")
-          go test "${args[@]}" ./api-e2e/... > "$out/results.json"
+          if [ -f api-e2e/Cargo.toml ]; then
+            python3 -I ../scripts/test/rust-results.py --package tests/api-e2e --output "$out/results.json" --run "$RUN" -- \
+              cargo test --locked --no-fail-fast --manifest-path api-e2e/Cargo.toml --test core --test journeys > "$out/tests.log" 2>&1
+          else
+            args=(-count=1 -json -timeout 40m)
+            [ -z "$RUN" ] || args+=(-run "$RUN")
+            go test "${args[@]}" ./api-e2e/... > "$out/results.json"
+          fi
           code=$?
           echo "code=$code" >> "$GITHUB_OUTPUT"
           src="$(git rev-parse HEAD)"
@@ -132,5 +141,5 @@ jobs:
         env:
           CODE: ${{ steps.t4.outputs.code }}
         run: |
-          echo "::error::go test exited $CODE; see the failed tests' output above and the results artifact"
+          echo "::error::test runner exited $CODE; see the failed tests' output above and the results artifact"
           exit 1

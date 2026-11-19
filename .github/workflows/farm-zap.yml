@@ -83,8 +83,11 @@ jobs:
           token: ${{ secrets.PRIVATE_REPO_PAT }}
           ref: ${{ inputs.source_ref || 'main' }}
           persist-credentials: false
-      - name: Set up Go
-        if: steps.key.outputs.ready == 'true'
+      - name: Rust toolchain for attack suite
+        if: ${{ steps.key.outputs.ready == 'true' && hashFiles('tests/security/Cargo.toml') != '' }}
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Set up legacy Go
+        if: ${{ steps.key.outputs.ready == 'true' && hashFiles('tests/go.mod') != '' }}
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: tests/go.mod
@@ -120,7 +123,8 @@ jobs:
         run: |
           set -euo pipefail
           echo "source $(git rev-parse HEAD)"
-          go -C tests test -count=1 ./security/...
+          if [ -f tests/security/Cargo.toml ]; then cargo test --locked --manifest-path tests/security/Cargo.toml --features live -- --nocapture
+          else go -C tests test -count=1 ./security/...; fi
       - name: Keep the encrypted reports
         if: ${{ !cancelled() && steps.key.outputs.ready == 'true' && env.ZAP_REPORT_RECIPIENT != '' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

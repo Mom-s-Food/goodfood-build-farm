@@ -171,7 +171,11 @@ jobs:
           if ! scripts/dev/up.sh --no-build > "$RUNNER_TEMP/android-replay-stack.log" 2>&1; then
             echo "::error::Android replay local stack did not become ready"; exit 1
           fi
+      - name: Rust toolchain for standalone suites
+        if: ${{ hashFiles('tests/api-e2e/Cargo.toml') != '' }}
+        run: rustup toolchain install stable --profile minimal --no-self-update
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: ${{ hashFiles('tests/go.mod') != '' }}
         with:
           go-version-file: tests/go.mod
           cache: false
@@ -180,7 +184,9 @@ jobs:
         working-directory: tests
         env:
           BASE_URL: http://localhost:8080
-        run: go test -count=1 -v ./contract/live/
+        run: |
+          if [ -f contract/Cargo.toml ]; then cargo run --locked --manifest-path contract/Cargo.toml --bin replay-live
+          else go test -count=1 -v ./contract/live/; fi
       - name: Record the T4 journeys into a new archive
         if: ${{ inputs.mode == 'record' }}
         working-directory: tests
@@ -190,7 +196,9 @@ jobs:
           SHA: ${{ steps.pin.outputs.sha }}
         run: |
           set -euo pipefail
-          go run ./contract/replay/cmd/record -target http://localhost:8080 \
+          recorder=(go run ./contract/replay/cmd/record)
+          if [ -f contract/Cargo.toml ]; then recorder=(cargo run --locked --manifest-path contract/Cargo.toml --bin record --); fi
+          "${recorder[@]}" -target http://localhost:8080 \
             -out "$RUNNER_TEMP/archive/$ARCHIVE" -journeys "$JOURNEYS" \
             -source "T4 journeys on the local stack (infra/compose/dev.yml), recorded by farm-replay.yml from goodfood-main $SHA"
       - name: Keep the archive for review (one day)
@@ -247,7 +255,9 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          if ! go run ./contract/replay/cmd/record -target http://127.0.0.1:8080 -listen 127.0.0.1:4010 \
+          recorder=(go run ./contract/replay/cmd/record)
+          if [ -f contract/Cargo.toml ]; then recorder=(cargo run --locked --manifest-path contract/Cargo.toml --bin record --); fi
+          if ! "${recorder[@]}" -target http://127.0.0.1:8080 -listen 127.0.0.1:4010 \
             -out "$RUNNER_TEMP/android-replay-archive/$ARCHIVE" -journeys AndroidT7 \
             -source "Mock Android T7 through a local simulated stack, from goodfood-main $SHA" \
             -command 'bash ../scripts/test/android-journeys.sh --local http://127.0.0.1:4010 --apk ../android/app/build/outputs/apk/mock/debug/app-mock-debug.apk --out "$RUNNER_TEMP/android-replay-journeys" --flow log-typed-meal' \

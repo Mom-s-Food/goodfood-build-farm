@@ -517,15 +517,23 @@ jobs:
         if: ${{ !cancelled() }}
         run: python -I scripts/test/req-coverage.py --lane-tests T8 > /dev/null
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && hashFiles('tests/go.mod') != '' }}
         with:
           go-version-file: scripts/design/gen-tokens/go.mod
           cache: false
+      - name: Rust toolchain for standalone tools
+        if: ${{ !cancelled() && hashFiles('tests/api-e2e/Cargo.toml') != '' }}
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt --no-self-update
       - name: Design tokens are generated and accessible
         if: ${{ !cancelled() }}
         run: |
-          go -C scripts/design/gen-tokens test -race -count=1 ./...
-          go -C scripts/design/gen-tokens run . --check
+          if [ -f scripts/design/gen-tokens/Cargo.toml ]; then
+            cargo test --locked --manifest-path scripts/design/gen-tokens/Cargo.toml
+            cargo run --locked --manifest-path scripts/design/gen-tokens/Cargo.toml -- --check
+          else
+            go -C scripts/design/gen-tokens test -race -count=1 ./...
+            go -C scripts/design/gen-tokens run . --check
+          fi
       # secrets (gitleaks): only what this commit adds to main. The findings are redacted, and
       # only the rule, file, line and commit are printed.
       - name: gitleaks on the commits this change adds
@@ -579,12 +587,12 @@ jobs:
 
       # contracts (Spectral, oasdiff through go run)
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && hashFiles('tests/go.mod') != '' }}
         with:
           go-version-file: tests/go.mod
           cache: false
       - name: Cache Go builds (oasdiff)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && hashFiles('tests/go.mod') != '' }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -613,10 +621,20 @@ jobs:
         working-directory: tests
         run: |
           set -euo pipefail
-          test -z "$(gofmt -l .)" || { gofmt -l .; echo "::error::gofmt the files above"; exit 1; }
-          go vet ./...
-          go build ./...
-          go test -count=1 -run '^$' ./...
+          if [ -f api-e2e/Cargo.toml ]; then
+            for manifest in {api-e2e,contract,synthetic,security,load}/Cargo.toml; do
+              cargo fmt --manifest-path "$manifest" --check
+              cargo clippy --locked --manifest-path "$manifest" --all-targets --all-features -- -D warnings
+              cargo test --locked --manifest-path "$manifest" --all-features --no-run
+              if [[ "$manifest" == *api-e2e* ]]; then ../scripts/test/api-units.sh
+              else cargo test --locked --manifest-path "$manifest"; fi
+            done
+          else
+            test -z "$(gofmt -l .)" || { gofmt -l .; echo "::error::gofmt the files above"; exit 1; }
+            go vet ./...
+            go build ./...
+            go test -count=1 -run '^$' ./...
+          fi
       # tests/load checks that need no server: budgets.json against PERFORMANCE_GOALS §3.1
       # (so a budget change cannot merge while k6's thresholds keep the old numbers), the
       # write accounting, the stress arithmetic, the budget gating and lib.js's node tests
@@ -627,14 +645,18 @@ jobs:
         working-directory: tests
         env:
           LOAD_REQUIRE_NODE: '1'
-        run: go test -count=1 -run 'TestBudgetTable|TestWriteAccounting|TestStressAnalysis|TestSummaryShape|TestBudgetUnmet|TestLoadLib' ./load/
+        run: |
+          if [ -f load/Cargo.toml ]; then cargo test --locked --manifest-path load/Cargo.toml --lib
+          else go test -count=1 -run 'TestBudgetTable|TestWriteAccounting|TestStressAnalysis|TestSummaryShape|TestBudgetUnmet|TestLoadLib' ./load/; fi
       # The compatibility-replay harness and every committed archive against a mirror (no
       # backend; farm-replay.yml replays them against the local stack). Skipped on commits
       # from before the harness existed (B9 Task 23).
       - name: Compatibility-replay harness (T3, tests/contract/replay)
-        if: ${{ !cancelled() && hashFiles('tests/contract/replay/*.go') != '' }}
+        if: ${{ !cancelled() && (hashFiles('tests/contract/replay/*.go') != '' || hashFiles('tests/contract/Cargo.toml') != '') }}
         working-directory: tests
-        run: go test -count=1 ./contract/replay/...
+        run: |
+          if [ -f contract/Cargo.toml ]; then cargo test --locked --manifest-path contract/Cargo.toml
+          else go test -count=1 ./contract/replay/...; fi
 
       # infra
 

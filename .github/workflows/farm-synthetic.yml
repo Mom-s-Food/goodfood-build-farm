@@ -113,7 +113,11 @@ jobs:
           done
           docker compose -f infra/compose/dev.yml ps
           echo "::error::the api did not become ready"; exit 1
+      - name: Rust toolchain for standalone suites
+        if: ${{ hashFiles('tests/api-e2e/Cargo.toml') != '' }}
+        run: rustup toolchain install stable --profile minimal --no-self-update
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: ${{ hashFiles('tests/go.mod') != '' }}
         with:
           go-version-file: tests/go.mod
           cache: false
@@ -122,7 +126,12 @@ jobs:
         env:
           SYNTHETIC_BASE_URL: http://localhost:8080
           DRIVER_TEST_DURATION: ${{ inputs.driver_duration }}
-        run: go test ./synthetic/ -count=1 -v -timeout 30m
+        run: |
+          if [ -f synthetic/Cargo.toml ]; then
+            cargo test --locked --manifest-path synthetic/Cargo.toml
+            cargo test --locked --manifest-path synthetic/Cargo.toml --test local -- seed_local_stack --exact --ignored --nocapture
+            cargo test --locked --manifest-path synthetic/Cargo.toml --test local -- driver_local_stack --exact --ignored --nocapture
+          else go test ./synthetic/ -count=1 -v -timeout 30m; fi
       - name: Stack status
         if: ${{ always() }}
         run: docker compose -f infra/compose/dev.yml ps --format '{{.Service}} {{.State}} {{.Status}}' || true

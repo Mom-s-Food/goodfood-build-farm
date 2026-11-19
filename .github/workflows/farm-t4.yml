@@ -9,7 +9,7 @@
 # It is its own workflow so farm-ci's time does not grow. Triggers:
 #   repository_dispatch trigger-t4  the private farm-dispatch sends it for a push to main that
 #                                   touches the backend, the contracts or the journeys (a path filter)
-#   workflow_dispatch               any commit, with an optional go test -run pattern
+#   workflow_dispatch               any commit, with an optional test-name regex
 #   push to a farm branch t4/**     runs main's journeys (a new copy of this file is registered
 #                                   for workflow_dispatch on that branch by its first run)
 #
@@ -34,7 +34,7 @@ on:
         required: false
         default: ''
       run:
-        description: 'Optional go test -run pattern; empty runs every journey'
+        description: 'Optional test-name regex; empty runs every journey'
         required: false
         default: ''
 
@@ -67,7 +67,7 @@ jobs:
           if [ -n "$REQUESTED" ] && ! printf '%s' "$REQUESTED" | grep -Eq '^[0-9a-f]{40}$'; then
             echo "::error::source_ref must be a full lowercase commit SHA"; exit 1
           fi
-          [ -z "$RUN" ] || printf '%s' "$RUN" | grep -Eq '^[A-Za-z0-9_|^$/.()-]{1,200}$' || { echo "::error::run must be a go test -run pattern"; exit 1; }
+          [ -z "$RUN" ] || printf '%s' "$RUN" | grep -Eq '^[A-Za-z0-9_|^$/.()-]{1,200}$' || { echo "::error::run must be a test-name regex"; exit 1; }
       # A throwaway server: data on tmpfs, no fsync. Same image as farm-ci and the compose file.
       - name: Start PostgreSQL 18 (tmpfs, fsync off)
         run: |
@@ -115,6 +115,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/bin"
           for b in api worker migrate; do install -m 0755 "target/debug/$b" "$RUNNER_TEMP/bin/$b"; done
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: ${{ hashFiles('tests/go.mod') != '' }}
         with:
           go-version-file: tests/go.mod
           cache: false
@@ -136,9 +137,14 @@ jobs:
         run: |
           set -uo pipefail
           out="$RUNNER_TEMP/t4"; mkdir -p "$out"
-          args=(-count=1 -json -timeout 40m)
-          [ -z "$RUN" ] || args+=(-run "$RUN")
-          go test "${args[@]}" ./api-e2e/... > "$out/results.json"
+          if [ -f api-e2e/Cargo.toml ]; then
+            python3 -I ../scripts/test/rust-results.py --package tests/api-e2e --output "$out/results.json" --run "$RUN" -- \
+              cargo test --locked --no-fail-fast --manifest-path api-e2e/Cargo.toml --test core --test journeys > "$out/tests.log" 2>&1
+          else
+            args=(-count=1 -json -timeout 40m)
+            [ -z "$RUN" ] || args+=(-run "$RUN")
+            go test "${args[@]}" ./api-e2e/... > "$out/results.json"
+          fi
           code=$?
           echo "code=$code" >> "$GITHUB_OUTPUT"
           jq -r 'select(.Test != null and (.Action == "pass" or .Action == "fail" or .Action == "skip"))
@@ -170,7 +176,7 @@ jobs:
           fi
           # Skipped journeys say why; a skip proves nothing.
           awk -F'\t' '$1 == "skip" {print $2}' "$out/tests.tsv" | while IFS= read -r t; do
-            jq -r --arg t "$t" 'select(.Test == $t and .Action == "output") | .Output' "$out/results.json" | grep -m1 -E '\.go:[0-9]+:' | sed "s|^|skip $t: |" || true
+            jq -r --arg t "$t" 'select(.Test == $t and .Action == "output") | .Output' "$out/results.json" | grep -m1 -E 'SKIP:|\.go:[0-9]+:' | sed "s|^|skip $t: |" || true
           done
       - name: Criteria the run proved
         if: ${{ !cancelled() && steps.t4.outcome != 'skipped' }}
@@ -238,7 +244,7 @@ jobs:
         env:
           CODE: ${{ steps.t4.outputs.code }}
         run: |
-          echo "::error::go test exited $CODE; see the failed tests' output above and the t4 artifact"
+          echo "::error::test runner exited $CODE; see the failed tests' output above and the t4 artifact"
           exit 1
       - name: Report farm/t4 on the private commit
         if: ${{ always() && steps.pin.outputs.source_ref != '' }}

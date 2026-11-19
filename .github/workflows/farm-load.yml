@@ -108,14 +108,20 @@ jobs:
           mkdir -p bin && mv "k6-${K6_VERSION}-linux-amd64/k6" bin/k6
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/bin/k6" version
+      - name: Rust toolchain for standalone suites
+        if: ${{ hashFiles('tests/api-e2e/Cargo.toml') != '' }}
+        run: rustup toolchain install stable --profile minimal --no-self-update
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: ${{ hashFiles('tests/go.mod') != '' }}
         with:
           go-version-file: tests/go.mod
           cache: false
       # The checks that need no server: the budget table against PERFORMANCE_GOALS, the
       # write accounting and the stress arithmetic (farm-ci runs them too, on every PR).
       - name: tests/load checks that need no server
-        run: go -C tests test -count=1 -run 'TestBudgetTable|TestWriteAccounting|TestStressAnalysis|TestSummaryShape' ./load/
+        run: |
+          if [ -f tests/load/Cargo.toml ]; then cargo test --locked --manifest-path tests/load/Cargo.toml --lib
+          else go -C tests test -count=1 -run 'TestBudgetTable|TestWriteAccounting|TestStressAnalysis|TestSummaryShape' ./load/; fi
       - name: Staging is up and is staging
         run: |
           set -euo pipefail
@@ -154,7 +160,7 @@ jobs:
           out="$RUNNER_TEMP/load"
           [ -s "$out/summary.json" ] || { echo "::error::k6 wrote no summary"; echo "rc=1" >> "$GITHUB_OUTPUT"; exit 0; }
           LOAD_SUMMARY="$out/summary.json" LOAD_REPORT="$out/report.md" \
-            go -C tests test -count=1 -run '^TestLoadSummary$' ./load/
+            bash -c 'if [ -f tests/load/Cargo.toml ]; then cargo test --locked --manifest-path tests/load/Cargo.toml --features live -- TestLoadSummary --nocapture; else go -C tests test -count=1 -run "^TestLoadSummary$" ./load/; fi'
           rc=$?
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
           {
